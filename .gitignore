@@ -1,0 +1,45 @@
+# Logs
+logs/
+*.log
+
+# Modèles (trop gros)
+*.pth
+*.bin
+*.safetensors
+*.gguf
+
+# Environnement Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Base de données locale
+*.db
+*.sqlite
+*.sqlite3
+
+# Fichiers temporaires
+*.tmp
+*.temp
+*.bak
+
+# Audio
+reponse.wav
+reponse.mp3
+
+# Cache Python
+.pytest_cache/
+.coverage
+htmlcov/
