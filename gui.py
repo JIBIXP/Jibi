@@ -1068,6 +1068,7 @@ class AgentWindow(QMainWindow):
         self.current_response = ""
         self.buffer_vocal = ""
         self.langue_vocale = "fr"
+        self.dans_bloc_code = False
 
         self.file_audio = []
         self.generation_vocale_finie = False
@@ -1091,13 +1092,67 @@ class AgentWindow(QMainWindow):
     # CHUNKS OLLAMA
     # ========================================================
 
+    def _envoyer_phrase_vocale(self, phrase):
+        """
+        Envoie une phrase déjà nettoyée (jamais du code brut) au
+        VoiceWorker, et met à jour le statut visuel de JIBI.
+        """
+
+        phrase = phrase.strip()
+
+        if not phrase:
+            return
+
+        self.langue_vocale = self.detecter_langue(phrase)
+        self.voice_worker.langue = self.langue_vocale
+        self.voice_worker.ajouter_phrase(phrase)
+
+        if self.status_label.text() == "🧠 Je réfléchis...":
+            self.status_label.setText("🔊 JIBI parle...")
+            self.system_status.setText("● Réponse")
+            self.system_status.setStyleSheet("color:#22d3ee;")
+
+            self.activer_visuel_vocal()
+
+            if not self.speaking_timer:
+                self.speaking_timer = QTimer()
+                self.speaking_timer.timeout.connect(
+                    lambda: self.set_niveau_vocal(random.uniform(0.3, 0.9))
+                )
+
+            self.speaking_timer.start(120)
+
     def on_agent_chunk(self, chunk):
         self.current_response += chunk
         self.update_last_message(self.current_response)
 
+        # L'affichage texte reçoit TOUT le contenu (y compris le code) via
+        # current_response ci-dessus. self.buffer_vocal, lui, ne sert qu'à
+        # préparer ce qui sera réellement prononcé — les blocs ``` en sont
+        # donc exclus, même quand ils arrivent en plusieurs morceaux
+        # successifs pendant le streaming.
         self.buffer_vocal += chunk
 
         while True:
+
+            if self.dans_bloc_code:
+
+                idx_fermeture = self.buffer_vocal.find("```")
+
+                if idx_fermeture == -1:
+                    # Bloc de code pas encore refermé : on attend la
+                    # suite du streaming, rien à envoyer à la voix.
+                    break
+
+                # Le contenu du bloc de code est jeté (jamais parlé) ;
+                # on annonce juste oralement qu'il est affiché à l'écran.
+                self.buffer_vocal = self.buffer_vocal[idx_fermeture + 3:]
+                self.dans_bloc_code = False
+                self._envoyer_phrase_vocale("J'ai affiché le code à l'écran.")
+                continue
+
+            idx_ouverture = self.buffer_vocal.find("```")
+
             position = -1
 
             for symbole in [".", "!", "?", "。", "！", "？"]:
@@ -1106,33 +1161,23 @@ class AgentWindow(QMainWindow):
                     if position == -1 or p < position:
                         position = p
 
+            if idx_ouverture != -1 and (position == -1 or idx_ouverture < position):
+                # Un bloc de code démarre avant la prochaine fin de
+                # phrase : on parle d'abord le texte normal qui précède,
+                # puis on bascule en mode "dans un bloc de code".
+                avant = self.buffer_vocal[:idx_ouverture]
+                self._envoyer_phrase_vocale(avant)
+                self.buffer_vocal = self.buffer_vocal[idx_ouverture + 3:]
+                self.dans_bloc_code = True
+                continue
+
             if position == -1:
                 break
 
-            phrase = self.buffer_vocal[:position + 1].strip()
+            phrase = self.buffer_vocal[:position + 1]
             self.buffer_vocal = self.buffer_vocal[position + 1:]
 
-            if not phrase:
-                continue
-
-            self.langue_vocale = self.detecter_langue(phrase)
-            self.voice_worker.langue = self.langue_vocale
-            self.voice_worker.ajouter_phrase(phrase)
-
-            if self.status_label.text() == "🧠 Je réfléchis...":
-                self.status_label.setText("🔊 JIBI parle...")
-                self.system_status.setText("● Réponse")
-                self.system_status.setStyleSheet("color:#22d3ee;")
-
-                self.activer_visuel_vocal()
-
-                if not self.speaking_timer:
-                    self.speaking_timer = QTimer()
-                    self.speaking_timer.timeout.connect(
-                        lambda: self.set_niveau_vocal(random.uniform(0.3, 0.9))
-                    )
-
-                self.speaking_timer.start(120)
+            self._envoyer_phrase_vocale(phrase)
 
     # ========================================================
     # AFFICHAGE STREAMING
@@ -1159,11 +1204,14 @@ class AgentWindow(QMainWindow):
 
         reste = self.buffer_vocal.strip()
 
-        if reste and self.voice_worker:
+        if reste and self.voice_worker and not self.dans_bloc_code:
             self.voice_worker.langue = self.detecter_langue(reste)
             self.voice_worker.ajouter_phrase(reste)
+        elif reste and self.dans_bloc_code:
+            self.voice_worker.ajouter_phrase("J'ai affiché le code à l'écran.")
 
         self.buffer_vocal = ""
+        self.dans_bloc_code = False
 
         if self.voice_worker:
             self.voice_worker.terminer()

@@ -1,4 +1,3 @@
-
 import atexit
 import os
 import re
@@ -206,6 +205,12 @@ def ecouter_jusqua_silence(
         int(calibration_ms / DUREE_TRAME_MS)
     )
 
+    # Les toutes premières trames d'un flux audio contiennent souvent
+    # un "clic" de démarrage (pic artificiel à ~1.0) qui n'a rien à
+    # voir avec le bruit ambiant réel. On les exclut de la calibration
+    # pour éviter qu'elles ne fassent exploser le seuil de détection.
+    FRAMES_IGNOREES_DEMARRAGE = 3
+
     niveaux_bruit = []
 
     # --------------------------------------------------------
@@ -253,7 +258,12 @@ def ecouter_jusqua_silence(
                 # Calibration
                 # ------------------------------------------------
 
-                if index < calibration_frames:
+                if index < FRAMES_IGNOREES_DEMARRAGE:
+
+                    # Trame de démarrage : ni calibrée, ni testée.
+                    continue
+
+                if index < FRAMES_IGNOREES_DEMARRAGE + calibration_frames:
 
                     niveaux_bruit.append(niveau)
 
@@ -261,8 +271,11 @@ def ecouter_jusqua_silence(
 
                 if niveaux_bruit:
 
+                    # Médiane plutôt que moyenne : une trame aberrante
+                    # isolée ne peut plus, à elle seule, faire grimper
+                    # le seuil de détection.
                     bruit_moyen = float(
-                        np.mean(niveaux_bruit)
+                        np.median(niveaux_bruit)
                     )
 
                 else:
@@ -273,9 +286,12 @@ def ecouter_jusqua_silence(
                 # Seuil adaptatif
                 # ------------------------------------------------
 
-                seuil_volume = max(
-                    0.02,
-                    bruit_moyen * 2.0
+                seuil_volume = min(
+                    0.3,
+                    max(
+                        0.02,
+                        bruit_moyen * 2.0
+                    )
                 )
 
                 # ------------------------------------------------
@@ -744,6 +760,58 @@ def decouper_en_phrases(
 
 
 # ============================================================
+# NETTOYAGE DU TEXTE AVANT SYNTHÈSE VOCALE
+# ============================================================
+
+# Blocs de code ```...``` (y compris ```json ... ```, ```python ... ```)
+_REGEX_BLOC_CODE = re.compile(r"```.*?```", re.DOTALL)
+
+# Code inline `...`
+_REGEX_CODE_INLINE = re.compile(r"`([^`]+)`")
+
+# Objet/liste JSON isolé sur sa propre portion de texte
+# (ex: réponse d'outil collée telle quelle : {"cle": "valeur"})
+_REGEX_JSON_BRUT = re.compile(r"[{\[][\s\S]*[}\]]")
+
+
+def nettoyer_texte_pour_voix(texte):
+    """
+    Retire tout ce qui ne doit jamais être lu à voix haute :
+    blocs de code, code inline, JSON brut.
+
+    Toujours appelée juste avant la synthèse (Kokoro ou serveur TTS),
+    quel que soit l'appelant (gui.py, agent.py, etc.) — le filtrage
+    ne dépend donc pas de la discipline du code appelant.
+    """
+
+    if not texte:
+        return texte
+
+    texte = _REGEX_BLOC_CODE.sub(
+        " J'ai mis le code à l'écran. ", texte
+    )
+
+    texte = _REGEX_CODE_INLINE.sub(r"\1", texte)
+
+    # Si après retrait des blocs de code il ne reste presque
+    # qu'un objet/liste JSON brut, on ne le lit pas tel quel.
+    texte_sans_espaces = texte.strip()
+
+    if texte_sans_espaces and texte_sans_espaces[0] in "{[":
+
+        correspondance = _REGEX_JSON_BRUT.match(texte_sans_espaces)
+
+        if correspondance and len(correspondance.group(0)) > len(texte_sans_espaces) * 0.6:
+
+            return "Voici le résultat, regarde à l'écran."
+
+    texte = re.sub(r"\n{2,}", ". ", texte)
+    texte = re.sub(r"[ \t]{2,}", " ", texte)
+
+    return texte.strip()
+
+
+# ============================================================
 # GÉNÉRATION AUDIO LOCALE
 # ============================================================
 
@@ -756,6 +824,8 @@ def generer_audio(
 
     Ne joue pas automatiquement le fichier.
     """
+
+    texte = nettoyer_texte_pour_voix(texte)
 
     if not texte:
 
@@ -844,9 +914,9 @@ def generer_audio_client(
 
         return None
 
-    texte = str(
-        texte
-    ).strip()
+    texte = nettoyer_texte_pour_voix(
+        str(texte).strip()
+    )
 
     if not texte:
 
