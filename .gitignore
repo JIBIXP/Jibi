@@ -43,3 +43,6 @@ reponse.mp3
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Secrets
+.env
