@@ -1,48 +1,76 @@
-# Logs
-logs/
-*.log
-
-# Modèles (trop gros)
-*.pth
-*.bin
-*.safetensors
-*.gguf
-
+# ========================
+# Fichiers système / IDE
+# ========================
 # Environnement Python
 .venv/
 venv/
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 
-# IDE
+# IDE (VSCode, PyCharm, etc.)
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS
+# OS (macOS, Windows)
 .DS_Store
 Thumbs.db
 
-# Base de données locale
-*.db
-*.sqlite
-*.sqlite3
-
+# ========================
 # Fichiers temporaires
+# ========================
 *.tmp
 *.temp
 *.bak
-
-# Audio
-reponse.wav
-reponse.mp3
+logs/
+*.log
 
 # Cache Python
 .pytest_cache/
 .coverage
 htmlcov/
 
+# ========================
+# Données sensibles
+# ========================
 # Secrets
 .env
+*.key
+*.pem
+
+# Base de données locale
+*.db
+*.sqlite
+*.sqlite3
+
+# ========================
+# Modèles d'IA (trop lourds)
+# ========================
+*.pth
+*.bin
+*.safetensors
+*.gguf
+*.h5
+*.onnx
+
+# ========================
+# Médias (audio, vidéo)
+# ========================
+*.wav
+*.mp3
+*.ogg
+*.flac
+
+# Fichiers audio
+*.wav
+*.mp3
+
+# Fichiers de test
+test_*.py
+
+# Workspace et backups
+workspace/
+*.json
+*.meta.json

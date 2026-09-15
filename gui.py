@@ -1,1637 +1,612 @@
-import json
-import subprocess
-import random
-import math
+# =========================================================
+# JIBI GUI v10 — Intégration complète de gui_kit
+# =========================================================
+# Remplace l'ancienne interface ttk (JibiGUI v9, "Warm Studio") par
+# un assemblage des composants de gui_kit/ : sidebar rétractable,
+# zone de conversation à bulles markdown, panneau d'artefact,
+# barre de saisie en pilule, indicateur de statut animé.
+#
+# La logique métier (routage, streaming, annulation, propositions,
+# diagnostic) est reprise de la v9 et adaptée aux nouveaux widgets :
+#   * chaque message est maintenant SON PROPRE widget Text
+#     (gui_kit.chat_view.MessageRow) au lieu d'un unique tampon
+#     partagé -> le bug de duplication/collage lors du streaming
+#     (déjà corrigé "à la main" en v9) devient structurellement
+#     impossible : append() n'ajoute que le delta, et la bascule
+#     finale passe par un set_text() complet, pas par des
+#     delete/insert répétés au même index.
+#   * le statut affiché passe par gui_kit.status.StatusPill : on
+#     étend son vocabulaire d'états (voir _EXTRA_STATES ci-dessous)
+#     plutôt que de modifier le fichier partagé gui_kit/status.py.
+# =========================================================
+from __future__ import annotations
+
 import sys
-import queue
+import threading
+import inspect
+from pathlib import Path
+from queue import Queue, Empty
+from datetime import datetime
 
-from PyQt5.QtCore import (
-    Qt,
-    QThread,
-    pyqtSignal,
-    QTimer,
-    QSize,
-    QPointF,
-    QUrl
-)
+import tkinter as tk
+from tkinter import filedialog
 
-from PyQt5.QtGui import (
-    QFont,
-    QColor,
-    QPainter,
-    QRadialGradient,
-    QTextCursor
-)
+from gui_kit import theme
+from gui_kit.state import UIState
+from gui_kit.sidebar import Sidebar
+from gui_kit.chat_view import ChatView
+from gui_kit.input_bar import InputBar
+from gui_kit.artifact_panel import ArtifactPanel
+from gui_kit.status import StatusPill, STATES as _STATUS_STATES
+from gui_kit.controls import IconButton, PillButton, RoundedFrame
+from gui_kit.scrollbar import ScrollArea, ThinScrollbar
 
-from PyQt5.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QTextEdit,
-    QTextBrowser,
-    QLineEdit,
-    QFrame,
-    QGraphicsDropShadowEffect
-)
+try:
+    from core.agent_core import AgentCore
+    from core import evolution
+    EV_OK = True
+except Exception:
+    class AgentCore:
+        def traiter_message(self, msg, **kwargs):
+            class R:
+                texte = ("[MODE SIMULÉ] Le module core/agent_core.py est introuvable.\n"
+                          "L'interface fonctionne, mais aucun agent n'est branché.")
+                proposition_id = None
+                action_requise = None
+            return R()
+    evolution = None
+    EV_OK = False
 
-from PyQt5.QtMultimedia import (
-    QMediaPlayer,
-    QMediaContent
-)
+# ---------------------------------------------------------
+# gui_kit.status.STATES ne connaît que ready/thinking/listening/
+# busy/offline/error. On y ajoute les états propres au routeur
+# JIBI (confirmation, annulé, terminé) plutôt que de toucher au
+# fichier partagé — ce sont des libellés d'affichage, pas de la
+# logique, donc l'extension ici est sans risque pour les autres
+# écrans qui utilisent gui_kit.status.
+# ---------------------------------------------------------
+_STATUS_STATES.setdefault("confirmation", ("Confirmation requise", theme.ACCENT, True))
+_STATUS_STATES.setdefault("cancelled", ("Annulé", theme.TEXT_SUB, False))
+_STATUS_STATES.setdefault("done", ("Terminé", theme.ACCENT, False))
 
-import qtawesome as qta
-from qt_material import apply_stylesheet
+STATE_PATH = Path(__file__).resolve().parent / "ui_state.json"
 
-from agent import ask_agent_stream
-from voix import generer_audio_client
-from logging_jibi import log_event, log_error
+SUGGESTIONS = [
+    "Explique-moi ce que tu sais faire",
+    "Écris une fonction Python de tri",
+    "Diagnostique mon projet",
+    "Résume ma dernière recherche",
+]
 
 
-# ============================================================
-# ONDE AUDIO
-# ============================================================
+class JibiGUI:
+    def __init__(self, agent=None):
+        self.etat = "ready"
+        self.root = tk.Tk()
+        self.root.title("JIBI • Aurora")
 
-class WaveWidget(QWidget):
+        self.state = UIState(STATE_PATH)
+        self.root.geometry(self.state.get("geometry", "1280x860+120+70"))
+        self.root.minsize(1000, 680)
+        self.root.configure(bg=theme.BG)
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
 
-    def __init__(self):
-        super().__init__()
+        self.agent = agent or AgentCore()
+        self.q = Queue()
+        self.busy = False
+        self.req_id = 0
+        self.cancelled = False
+        self.cancel_ev = None
+        self._stream_buf = ""
+        self._current_bot_row = None
 
-        self.setMinimumHeight(120)
+        self.sessions: list[dict] = []
+        self.current_session_id = None
+        self._active_view = "chat"
+        self._selected_prop = None
+        self._prop_rows: dict = {}
 
-        self.nb_barres = 56
-        self.niveaux = [0.04] * self.nb_barres
+        self._build_ui()
+        self._new_session("Nouvelle discussion")
+        self.root.after(200, self._refresh_model_status)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.niveau_courant = 0
-        self.active = False
+    # ================================================== construction
+    def _build_ui(self):
+        root_frame = tk.Frame(self.root, bg=theme.BG)
+        root_frame.pack(fill="both", expand=True)
 
-        self.couleur_fond = QColor("#081018")
-        self.couleur_a = QColor("#22d3ee")
-        self.couleur_b = QColor("#38bdf8")
+        self._build_topbar(root_frame)
+        tk.Frame(root_frame, bg=theme.BORDER_SOFT, height=1).pack(fill="x")
 
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.avancer)
-        self.timer.start(45)
+        body = tk.Frame(root_frame, bg=theme.BG)
+        body.pack(fill="both", expand=True)
 
-    def set_level(self, level):
-        self.niveau_courant = max(0, min(1, float(level)))
+        self.sidebar = Sidebar(
+            body, state=self.state,
+            on_new_chat=self._new_chat_clicked,
+            on_nav=self._on_nav,
+            on_open_session=self._on_open_session,
+            on_delete_session=self._on_delete_session,
+        )
+        self.sidebar.pack(side="left", fill="y")
+        # Contournement : Sidebar.__init__ ne masque pas son contenu quand
+        # l'état persisté est "fermé" (seul ArtifactPanel le fait). On force
+        # le repli visuel une fois la fenêtre construite.
+        if not self.sidebar.is_open:
+            self.sidebar._open = True
+            self.sidebar.collapse(animate=False)
 
-    def set_active(self, active):
-        self.active = active
-        if not active:
-            self.niveau_courant = 0
+        self.artifact_panel = ArtifactPanel(
+            body, state=self.state, on_save=self._save_artifact,
+            on_close=lambda: self.input_bar.focus_input(),
+        )
+        self.artifact_panel.pack(side="right", fill="y")
+        if self.state.get("panel_open"):
+            self.artifact_panel.restore()
 
-    def avancer(self):
-        if self.active:
-            cible = 0.15 + self.niveau_courant * 1.6
+        self.center = tk.Frame(body, bg=theme.BG)
+        self.center.pack(side="left", fill="both", expand=True)
+        self.center.grid_rowconfigure(0, weight=1)
+        self.center.grid_columnconfigure(0, weight=1)
+
+        self.chat_view = ChatView(
+            self.center, on_expand_code=self._open_code_panel,
+            on_suggestion=self._on_suggestion, bg=theme.BG,
+        )
+        self.proposals_view = self._build_proposals_view(self.center)
+
+        self.input_bar = InputBar(
+            self.center, on_send=self.send, on_attach=self._on_attach,
+            on_mic=self._on_mic, on_stop=self.cancel, bg=theme.BG,
+        )
+
+        self.show_view("chat")
+
+    def _build_topbar(self, parent):
+        top = tk.Frame(parent, bg=theme.BG, height=56)
+        top.pack(fill="x", side="top")
+        top.pack_propagate(False)
+
+        left = tk.Frame(top, bg=theme.BG)
+        left.pack(side="left", padx=theme.SPACE_LG)
+        IconButton(left, icon="panel_left", kind="ghost", size=32, icon_size=16,
+                   tooltip="Basculer la barre latérale",
+                   command=lambda: self.sidebar.toggle(), bg=theme.BG).pack(
+            side="left", pady=12)
+        tk.Label(left, text="JIBI", bg=theme.BG, fg=theme.TEXT,
+                 font=theme.serif(15, bold=True)).pack(side="left", padx=(10, 6))
+        badge = RoundedFrame(left, radius=8, card_bg=theme.ACCENT_SOFT, bg=theme.BG, pad=0)
+        badge.pack(side="left")
+        tk.Label(badge.body, text="AURORA", bg=theme.ACCENT_SOFT, fg=theme.ACCENT,
+                 font=theme.sans(8, bold=True)).pack(padx=8, pady=3)
+
+        right = tk.Frame(top, bg=theme.BG)
+        right.pack(side="right", padx=theme.SPACE_LG)
+        self.status_pill = StatusPill(right, state="ready", bg=theme.BG)
+        self.status_pill.pack(side="right", pady=12)
+        IconButton(right, icon="settings", kind="ghost", size=32, icon_size=16,
+                   tooltip="Paramètres", command=self._show_settings_stub,
+                   bg=theme.BG).pack(side="right", padx=(0, 8), pady=12)
+        return top
+
+    def _build_proposals_view(self, master):
+        v = tk.Frame(master, bg=theme.BG)
+        v.grid_rowconfigure(0, weight=1)
+        v.grid_columnconfigure(1, weight=1)
+
+        left = tk.Frame(v, bg=theme.PANEL, width=300)
+        left.grid(row=0, column=0, sticky="ns")
+        left.grid_propagate(False)
+        tk.Label(left, text="PROPOSITIONS", bg=theme.PANEL, fg=theme.TEXT_FAINT,
+                 font=theme.sans(9, bold=True)).pack(
+            anchor="w", padx=theme.SPACE_MD, pady=(theme.SPACE_LG, theme.SPACE_SM))
+        self.props_area = ScrollArea(left, bg=theme.PANEL, auto_scroll=False)
+        self.props_area.pack(fill="both", expand=True, padx=theme.SPACE_SM,
+                             pady=(0, theme.SPACE_SM))
+
+        right = tk.Frame(v, bg=theme.BG)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        head = tk.Frame(right, bg=theme.BG)
+        head.grid(row=0, column=0, sticky="ew", padx=theme.SPACE_LG,
+                 pady=(theme.SPACE_LG, theme.SPACE_SM))
+        self.diff_title = tk.Label(head, text="Sélectionnez une proposition",
+                                   bg=theme.BG, fg=theme.TEXT, font=theme.serif(15, bold=True))
+        self.diff_title.pack(side="left")
+        btns = tk.Frame(head, bg=theme.BG)
+        btns.pack(side="right")
+        PillButton(btns, text="Autoriser", icon="check", kind="primary", height=32,
+                   command=self._auth_selected).pack(side="left", padx=(0, 6))
+        PillButton(btns, text="Rejeter", icon="close", kind="ghost", height=32,
+                   command=self._reject_selected).pack(side="left")
+
+        diff_wrap = tk.Frame(right, bg=theme.PANEL)
+        diff_wrap.grid(row=1, column=0, sticky="nsew", padx=theme.SPACE_LG,
+                       pady=(0, theme.SPACE_LG))
+        diff_wrap.grid_rowconfigure(0, weight=1)
+        diff_wrap.grid_columnconfigure(0, weight=1)
+        sb = ThinScrollbar(diff_wrap, bg=theme.PANEL)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.diff_text = tk.Text(diff_wrap, wrap="none", bg=theme.PANEL, fg=theme.TEXT,
+                                 font=theme.mono(10), bd=0, padx=14, pady=14,
+                                 highlightthickness=0, relief="flat", state="disabled",
+                                 insertbackground=theme.ACCENT)
+        self.diff_text.grid(row=0, column=0, sticky="nsew")
+        sb.attach(self.diff_text)
+        self.diff_text.tag_configure("add", foreground=theme.ACCENT)
+        self.diff_text.tag_configure("del", foreground=theme.DANGER)
+        self.diff_text.tag_configure("hunk", foreground=theme.ACCENT, font=theme.mono(10, bold=True))
+        return v
+
+    # ================================================== vues
+    def show_view(self, name: str):
+        self._active_view = name
+        if name == "chat":
+            self.proposals_view.grid_forget()
+            self.chat_view.grid(row=0, column=0, sticky="nsew")
+            self.input_bar.grid(row=1, column=0, sticky="ew")
         else:
-            cible = 0.04
-
-        bruit = random.uniform(0.75, 1.25)
-        nouvelle_valeur = max(0.03, min(1.0, cible * bruit))
-
-        self.niveaux.pop(0)
-        self.niveaux.append(nouvelle_valeur)
-
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        largeur = self.width()
-        hauteur = self.height()
-
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(self.couleur_fond)
-        painter.drawRoundedRect(0, 0, largeur, hauteur, 18, 18)
-
-        marge = 18
-        zone_largeur = largeur - marge * 2
-
-        nb = len(self.niveaux)
-        espace = 3
-
-        largeur_barre = max(2.0, (zone_largeur - espace * (nb - 1)) / nb)
-
-        centre_y = hauteur / 2
-        hauteur_max = hauteur - 28
-
-        x = marge
-
-        for i, niveau in enumerate(self.niveaux):
-            h_barre = max(3.0, niveau * hauteur_max)
-
-            couleur = self.couleur_a if i % 2 == 0 else self.couleur_b
-            painter.setBrush(couleur)
-
-            rayon = largeur_barre / 2
-
-            painter.drawRoundedRect(
-                int(x),
-                int(centre_y - h_barre / 2),
-                int(largeur_barre),
-                int(h_barre),
-                rayon,
-                rayon
-            )
-
-            x += largeur_barre + espace
-
-
-# ============================================================
-# ORBE JIBI
-# ============================================================
-
-class OrbeWidget(QWidget):
-
-    def __init__(self):
-        super().__init__()
-
-        self.setMinimumSize(220, 220)
-
-        self.niveau = 0.0
-        self.actif = False
-        self.phase = 0.0
-
-        self.timer = QTimer()
-        self.timer.timeout.connect(self._animer)
-        self.timer.start(30)
-
-    def set_level(self, level):
-        self.niveau = max(0.0, min(1.0, float(level)))
-
-    def set_active(self, actif):
-        self.actif = actif
-        if not actif:
-            self.niveau = 0.0
-
-    def _animer(self):
-        self.phase += 0.08
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        largeur = self.width()
-        hauteur = self.height()
-
-        cx = largeur / 2
-        cy = hauteur / 2
-
-        base = min(largeur, hauteur) * 0.24
-
-        respiration = 1 + 0.08 * math.sin(self.phase)
-
-        rayon = base * respiration
-
-        if self.actif:
-            rayon += base * self.niveau * 0.9
-
-        # Halo extérieur
-        halo = QRadialGradient(QPointF(cx, cy), rayon * 2.4)
-        halo.setColorAt(0.0, QColor(34, 211, 238, 130))
-        halo.setColorAt(0.55, QColor(34, 211, 238, 40))
-        halo.setColorAt(1.0, QColor(34, 211, 238, 0))
-
-        painter.setBrush(halo)
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(QPointF(cx, cy), rayon * 2.4, rayon * 2.4)
-
-        # Noyau
-        noyau = QRadialGradient(QPointF(cx, cy), rayon)
-        noyau.setColorAt(0.0, QColor(6, 10, 15))
-        noyau.setColorAt(0.65, QColor(10, 18, 26))
-        noyau.setColorAt(1.0, QColor(34, 211, 238, 220))
-
-        painter.setBrush(noyau)
-        painter.drawEllipse(QPointF(cx, cy), rayon, rayon)
-
-
-# ============================================================
-# OVERLAY VOCAL
-# ============================================================
-
-class DialogueOverlay(QWidget):
-
-    def __init__(self, parent):
-        super().__init__(parent)
-
-        self.layout_principal = QVBoxLayout(self)
-        self.layout_principal.setContentsMargins(0, 25, 0, 35)
-
-        ligne_fermer = QHBoxLayout()
-        ligne_fermer.setContentsMargins(0, 0, 20, 0)
-        ligne_fermer.addStretch()
-
-        self.bouton_fermer = QPushButton()
-        self.bouton_fermer.setIcon(qta.icon("fa5s.times", color="#94a3b8"))
-        self.bouton_fermer.setIconSize(QSize(16, 16))
-        self.bouton_fermer.setFixedSize(40, 40)
-        self.bouton_fermer.setFlat(True)
-
-        ligne_fermer.addWidget(self.bouton_fermer)
-        self.layout_principal.addLayout(ligne_fermer)
-
-        self.orbe = OrbeWidget()
-        self.layout_principal.addWidget(self.orbe, 1)
-
-    def ajouter_barres(self, widget_barres):
-        conteneur = QHBoxLayout()
-        conteneur.setContentsMargins(80, 0, 80, 0)
-        conteneur.addWidget(widget_barres)
-        self.layout_principal.addLayout(conteneur)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(3, 7, 12, 245))
-
-
-# ============================================================
-# MICRO
-# ============================================================
-
-class ListeningWorker(QThread):
-
-    level = pyqtSignal(float)
-    finished = pyqtSignal(str, str)
-    error = pyqtSignal(str)
-
-    def run(self):
-        try:
-            processus = subprocess.Popen(
-                [sys.executable, "ecoute_process.py"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1
-            )
-
-            for ligne in processus.stdout:
-                ligne = ligne.strip()
-
-                if not ligne:
-                    continue
-
-                try:
-                    data = json.loads(ligne)
-                except json.JSONDecodeError:
-                    continue
-
-                if "level" in data:
-                    self.level.emit(float(data["level"]))
-                elif "texte" in data:
-                    self.finished.emit(data.get("texte", ""), data.get("langue", ""))
-                    break
-
-            processus.wait()
-
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-# ============================================================
-# VEILLE (MOT D'ACTIVATION)
-# ============================================================
-
-class WakeWordWorker(QThread):
-    """
-    Lance ecoute_process.py en mode --veille : le sous-processus écoute
-    en boucle jusqu'à détecter le mot d'activation, puis remonte la
-    commande qui suit. Contrairement à ListeningWorker, ce processus
-    peut tourner longtemps (indéfiniment) : arreter() permet de le
-    couper proprement, notamment juste avant que JIBI se mette à
-    parler, pour qu'il n'entende jamais sa propre voix.
-    """
-
-    level = pyqtSignal(float)
-    finished = pyqtSignal(str, str)
-    error = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-        self.processus = None
-
-    def run(self):
-        try:
-            self.processus = subprocess.Popen(
-                [sys.executable, "ecoute_process.py", "--veille"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1
-            )
-
-            for ligne in self.processus.stdout:
-                ligne = ligne.strip()
-
-                if not ligne:
-                    continue
-
-                try:
-                    data = json.loads(ligne)
-                except json.JSONDecodeError:
-                    continue
-
-                if "level" in data:
-                    self.level.emit(float(data["level"]))
-                elif "texte" in data:
-                    self.finished.emit(data.get("texte", ""), data.get("langue", ""))
-                    break
-
-            self.processus.wait()
-
-        except Exception as e:
-            self.error.emit(str(e))
-
-    def arreter(self):
-        """Coupe le sous-processus de veille immédiatement (mic muet)."""
-
-        if self.processus and self.processus.poll() is None:
+            self.chat_view.grid_forget()
+            self.input_bar.grid_forget()
+            self.proposals_view.grid(row=0, column=0, rowspan=2, sticky="nsew")
+            self.refresh_props()
+        self.sidebar.set_active_nav(name)
+
+    def _on_nav(self, key: str):
+        self.show_view(key)
+
+    # ================================================== sessions
+    def _new_session(self, title: str):
+        sid = datetime.now().strftime("%Y%m%d_%H%M%S%f")
+        self.sessions.insert(0, {"id": sid, "title": title,
+                                 "meta": datetime.now().strftime("%H:%M")})
+        self.current_session_id = sid
+        self.sidebar.set_sessions(self.sessions)
+        self.sidebar.select_session(sid)
+        self.chat_view.clear()
+        self.chat_view.set_suggestions(SUGGESTIONS)
+        self.sidebar.set_nav_counts(chat=0)
+        self.show_view("chat")
+
+    def _new_chat_clicked(self):
+        if self.busy:
+            return
+        self._new_session("Nouvelle discussion")
+
+    def _on_open_session(self, session: dict):
+        # Pas de persistance des messages par session pour l'instant
+        # (comportement identique à la v9 : seul le libellé change).
+        self.current_session_id = session.get("id")
+        self.sidebar.select_session(self.current_session_id)
+
+    def _on_delete_session(self, session: dict):
+        self.sessions = [s for s in self.sessions if s.get("id") != session.get("id")]
+        self.sidebar.set_sessions(self.sessions)
+
+    # ================================================== statut
+    def set_status(self, s: str):
+        self.etat = s
+        self.status_pill.set_state(s)
+
+    def _refresh_model_status(self):
+        # disponible() fait un appel réseau (jusqu'à 3s de timeout) : on
+        # l'exécute dans un thread pour ne jamais geler l'UI, contrairement
+        # à un appel direct sur le thread principal de Tk.
+        def worker():
             try:
-                self.processus.terminate()
+                from core import cerveau
+                ok = bool(cerveau.disponible())
+                name = cerveau.MODEL if EV_OK else "Mode simulé"
+            except Exception:
+                ok, name = False, "Mode simulé"
+            self.root.after(0, lambda: self.sidebar.set_model(
+                name, "Opérationnel" if ok else "Hors ligne", online=ok))
+        threading.Thread(target=worker, daemon=True).start()
+        self.root.after(15000, self._refresh_model_status)
+
+    # ================================================== envoi / réception
+    def send(self, text: str):
+        if self.busy:
+            return
+        msg = (text or "").strip()
+        if not msg:
+            return
+        self.busy = True
+        self.cancelled = False
+        self.req_id += 1
+        req = self.req_id
+        self.cancel_ev = threading.Event()
+        self._stream_buf = ""
+        self._current_bot_row = None
+
+        self.set_status("thinking")
+        self.input_bar.set_busy(True)
+        self.chat_view.add_user(msg, meta=datetime.now().strftime("%H:%M"))
+        self.chat_view.show_typing()
+
+        def on_chunk(chunk: str):
+            if self.cancelled or req != self.req_id:
+                return
+            def do():
+                if self.etat != "busy" and not self.cancelled:
+                    self.set_status("busy")
+                    self.chat_view.hide_typing()
+                    self._current_bot_row = self.chat_view.add_bot(
+                        "", meta=datetime.now().strftime("%H:%M"))
+                if not chunk or self._current_bot_row is None:
+                    return
+                # Le backend peut envoyer des deltas OU un cumulatif selon
+                # l'API (Ollama envoie des deltas, certains relais renvoient
+                # le texte complet à chaque chunk) : on ne pousse jamais que
+                # la partie nouvelle dans le widget.
+                if self._stream_buf and chunk.startswith(self._stream_buf):
+                    delta = chunk[len(self._stream_buf):]
+                    self._stream_buf = chunk
+                else:
+                    delta = chunk
+                    self._stream_buf += chunk
+                if delta:
+                    self._current_bot_row.append(delta)
+                    self.chat_view.scroll_to_bottom()
+            self.root.after(0, do)
+
+        def worker():
+            try:
+                sig = inspect.signature(self.agent.traiter_message)
+                kw = {}
+                if "on_chunk" in sig.parameters:
+                    kw["on_chunk"] = on_chunk
+                if "cancel_event" in sig.parameters:
+                    kw["cancel_event"] = self.cancel_ev
+                rep = self.agent.traiter_message(msg, **kw)
+                self.q.put((req, "ok", rep))
+            except Exception as e:
+                self.q.put((req, "err", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.root.after(80, self.poll)
+
+    def poll(self):
+        try:
+            while True:
+                req, kind, payload = self.q.get_nowait()
+                if req != self.req_id:
+                    continue
+                break
+        except Empty:
+            if self.busy and not self.cancelled:
+                self.root.after(80, self.poll)
+            return
+
+        if self.cancelled:
+            return
+
+        self.chat_view.hide_typing()
+
+        if kind == "ok":
+            rep = payload
+            txt = getattr(rep, "texte", str(rep))
+            if self._current_bot_row is not None:
+                self._current_bot_row.replace_streamed(txt)
+            else:
+                self._current_bot_row = self.chat_view.add_bot(
+                    txt, meta=datetime.now().strftime("%H:%M"))
+            self.chat_view.scroll_to_bottom()
+
+            if getattr(rep, "proposition_id", None):
+                self.refresh_props()
+            act = getattr(rep, "action_requise", None) or {}
+            if act.get("type") == "confirmation" and act.get("id"):
+                self.input_bar.set_text(f"CONFIRME {act['id']}")
+                self.set_status("confirmation")
+            else:
+                self.set_status("done")
+                self.root.after(1200, lambda: self.set_status("ready") if not self.busy else None)
+        else:
+            err = f"❌ Erreur : {payload}"
+            if self._current_bot_row is not None:
+                self._current_bot_row.replace_streamed(err)
+            else:
+                self.chat_view.add_bot(err, meta=datetime.now().strftime("%H:%M"))
+            self.chat_view.scroll_to_bottom()
+            self.set_status("error")
+            self.root.after(2000, lambda: self.set_status("ready") if not self.busy else None)
+
+        self.busy = False
+        self.cancel_ev = None
+        self.input_bar.set_busy(False)
+        self.input_bar.focus_input()
+
+    def cancel(self):
+        if not self.busy:
+            return
+        self.cancelled = True
+        if self.cancel_ev:
+            try:
+                self.cancel_ev.set()
             except Exception:
                 pass
-
-
-# ============================================================
-# AGENT
-# ============================================================
-
-class AgentWorker(QThread):
-
-    chunk_received = pyqtSignal(str)
-    finished = pyqtSignal(str)
-    error = pyqtSignal(str)
-
-    def __init__(self, texte):
-        super().__init__()
-        self.texte = texte
-
-    def run(self):
-        try:
-            def on_chunk(chunk):
-                self.chunk_received.emit(chunk)
-
-            reponse = ask_agent_stream(self.texte, on_chunk)
-            self.finished.emit(reponse)
-
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-# ============================================================
-# VOIX — SYNTHÈSE EN STREAMING
-# ============================================================
-
-class VoiceWorker(QThread):
-
-    phrase_pret = pyqtSignal(str)
-    finished = pyqtSignal()
-    error = pyqtSignal(str)
-
-    def __init__(self, langue):
-        super().__init__()
-        self.langue = langue
-        self.file_phrases = queue.Queue()
-        self.generation_terminee = False
-        self.arret = False
-
-    def ajouter_phrase(self, phrase):
-        phrase = phrase.strip()
-        if phrase:
-            self.file_phrases.put(phrase)
-
-    def terminer(self):
-        self.generation_terminee = True
-
-    def stop_worker(self):
-        self.arret = True
-        self.file_phrases.put(None)
-
-    def run(self):
-        try:
-            while not self.arret:
-                try:
-                    phrase = self.file_phrases.get(timeout=0.1)
-                except queue.Empty:
-                    if self.generation_terminee and self.file_phrases.empty():
-                        break
-                    continue
-
-                if phrase is None:
-                    break
-
-                chemin = generer_audio_client(phrase, self.langue)
-
-                if chemin:
-                    self.phrase_pret.emit(chemin)
-
-            self.finished.emit()
-
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-# ============================================================
-# FENÊTRE PRINCIPALE
-# ============================================================
-
-class AgentWindow(QMainWindow):
-
-    def __init__(self):
-        super().__init__()
-
-        self.setWindowTitle("JIBI — Assistant IA")
-        self.resize(1400, 850)
-        self.setMinimumSize(1050, 700)
-
-        # Workers
-        self.listening_worker = None
-        self.agent_worker = None
-        self.voice_worker = None
-        self.wake_worker = None
-
-        self.speaking_timer = None
-        self.mode_dialogue = False
-        self.veille_active = False
-
-        # Audio
-        self.lecteur_audio = QMediaPlayer()
-        self.lecteur_audio.mediaStatusChanged.connect(self.audio_status_changed)
-
-        # Réponse
-        self.current_response = ""
-
-        # Streaming vocal
-        self.buffer_vocal = ""
-        self.langue_vocale = "fr"
-
-        # File audio
-        self.file_audio = []
-        self.generation_vocale_finie = False
-        self.lecture_en_cours = False
-
-        self.setup_ui()
-
-    # ========================================================
-    # FERMETURE
-    # ========================================================
-
-    def closeEvent(self, event):
-        if self.listening_worker and self.listening_worker.isRunning():
-            self.listening_worker.wait(3000)
-
-        if self.wake_worker and self.wake_worker.isRunning():
-            self.wake_worker.arreter()
-            self.wake_worker.wait(3000)
-
-        if self.agent_worker and self.agent_worker.isRunning():
-            self.agent_worker.wait(3000)
-
-        if self.voice_worker:
-            if self.voice_worker.isRunning():
-                self.voice_worker.stop_worker()
-                self.voice_worker.wait(3000)
-
-        if self.lecteur_audio.state() == QMediaPlayer.PlayingState:
-            self.lecteur_audio.stop()
-
-        super().closeEvent(event)
-
-    # ========================================================
-    # REDIMENSIONNEMENT
-    # ========================================================
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, "overlay") and self.centralWidget():
-            self.overlay.setGeometry(self.centralWidget().rect())
-
-    # ========================================================
-    # OMBRE
-    # ========================================================
-
-    def appliquer_ombre(self, widget, flou=25, decalage_y=6, opacite=180, couleur=(0, 0, 0)):
-        ombre = QGraphicsDropShadowEffect()
-        ombre.setBlurRadius(flou)
-        ombre.setOffset(0, decalage_y)
-        ombre.setColor(QColor(couleur[0], couleur[1], couleur[2], opacite))
-        widget.setGraphicsEffect(ombre)
-
-    # ========================================================
-    # INTERFACE
-    # ========================================================
-
-    def setup_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-
-        self.overlay = DialogueOverlay(central)
-        self.overlay.bouton_fermer.clicked.connect(self.fermer_overlay)
-        self.overlay.hide()
-
-        layout = QHBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        # ====================================================
-        # SIDEBAR
-        # ====================================================
-
-        sidebar = QFrame()
-        sidebar.setFixedWidth(245)
-        sidebar.setStyleSheet("""
-            QFrame {
-                background-color: #080d13;
-                border-right: 1px solid #17212b;
-            }
-        """)
-
-        side = QVBoxLayout(sidebar)
-        side.setContentsMargins(22, 25, 22, 22)
-        side.setSpacing(12)
-
-        logo = QLabel("JIBI")
-        logo.setFont(QFont("Arial", 30, QFont.Bold))
-        logo.setStyleSheet("""
-            color: #22d3ee;
-            letter-spacing: 3px;
-        """)
-        side.addWidget(logo)
-
-        desc = QLabel("ASSISTANT PERSONNEL IA")
-        desc.setStyleSheet("""
-            color: #64748b;
-            font-size: 10px;
-            letter-spacing: 1px;
-        """)
-        side.addWidget(desc)
-
-        side.addSpacing(25)
-
-        new_button = QPushButton("  Nouvelle conversation")
-        new_button.setIcon(qta.icon("fa5s.plus", color="#22d3ee"))
-        new_button.setMinimumHeight(42)
-        new_button.setStyleSheet("""
-            QPushButton {
-                background: #102a38;
-                color: #dff8ff;
-                border: 1px solid #155e75;
-                border-radius: 10px;
-                padding: 9px 12px;
-                font-weight: bold;
-                text-align: left;
-            }
-
-            QPushButton:hover {
-                background: #164e63;
-                border: 1px solid #22d3ee;
-            }
-
-            QPushButton:pressed {
-                background: #0e7490;
-            }
-        """)
-        new_button.clicked.connect(self.clear_chat)
-        side.addWidget(new_button)
-
-        side.addSpacing(10)
-
-        separateur = QFrame()
-        separateur.setFrameShape(QFrame.HLine)
-        separateur.setStyleSheet("color: #17212b;")
-        side.addWidget(separateur)
-
-        side.addStretch()
-
-        status = QLabel("SYSTÈME")
-        status.setStyleSheet("""
-            color: #475569;
-            font-size: 10px;
-            font-weight: bold;
-            letter-spacing: 1px;
-        """)
-        side.addWidget(status)
-
-        self.system_status = QLabel("● Prêt")
-        self.system_status.setStyleSheet("""
-            color: #22c55e;
-            font-weight: bold;
-        """)
-        side.addWidget(self.system_status)
-
-        side.addSpacing(8)
-
-        self.status_label = QLabel("Prêt à converser")
-        self.status_label.setStyleSheet("""
-            color: #94a3b8;
-            font-size: 12px;
-        """)
-        self.status_label.setWordWrap(True)
-        side.addWidget(self.status_label)
-
-        layout.addWidget(sidebar)
-
-        # ====================================================
-        # CENTRE
-        # ====================================================
-
-        center = QFrame()
-        center.setStyleSheet("""
-            QFrame {
-                background: #0d151e;
-            }
-        """)
-
-        center_layout = QVBoxLayout(center)
-        center_layout.setContentsMargins(32, 24, 32, 22)
-        center_layout.setSpacing(14)
-
-        # En-tête
-        header = QHBoxLayout()
-        title_box = QVBoxLayout()
-
-        title = QLabel("Conversation")
-        title.setFont(QFont("Arial", 21, QFont.Bold))
-        title.setStyleSheet("color: #e2f8ff;")
-        title_box.addWidget(title)
-
-        subtitle = QLabel("JIBI est prêt à vous écouter")
-        subtitle.setStyleSheet("""
-            color: #64748b;
-            font-size: 11px;
-        """)
-        title_box.addWidget(subtitle)
-
-        header.addLayout(title_box)
-        header.addStretch()
-
-        badge = QLabel("●  LOCAL AI")
-        badge.setAlignment(Qt.AlignCenter)
-        badge.setStyleSheet("""
-            QLabel {
-                background: #0b2632;
-                color: #22d3ee;
-                border: 1px solid #155e75;
-                border-radius: 12px;
-                padding: 7px 12px;
-                font-size: 10px;
-                font-weight: bold;
-            }
-        """)
-        header.addWidget(badge)
-
-        center_layout.addLayout(header)
-
-        # ====================================================
-        # CHAT
-        # ====================================================
-
-        self.chat = QTextBrowser()
-        self.chat.setReadOnly(True)
-        self.chat.setStyleSheet("""
-            QTextBrowser {
-                background: #091119;
-                color: #dbeafe;
-                border: 1px solid #1b3444;
-                border-radius: 16px;
-                padding: 18px;
-                font-size: 14px;
-                font-family: "Segoe UI", Arial;
-            }
-
-            QTextBrowser:focus {
-                border: 1px solid #155e75;
-            }
-
-            QScrollBar:vertical {
-                background: #091119;
-                width: 8px;
-                border-radius: 4px;
-                margin: 4px;
-            }
-
-            QScrollBar::handle:vertical {
-                background: #155e75;
-                border-radius: 4px;
-                min-height: 30px;
-            }
-
-            QScrollBar::handle:vertical:hover {
-                background: #22d3ee;
-            }
-        """)
-        self.appliquer_ombre(self.chat, flou=35, decalage_y=8, opacite=130)
-        center_layout.addWidget(self.chat, 1)
-
-        # ====================================================
-        # STREAMING
-        # ====================================================
-
-        self.streaming_message = QTextEdit()
-        self.streaming_message.setReadOnly(True)
-        self.streaming_message.setMaximumHeight(145)
-        self.streaming_message.setVisible(False)
-        self.streaming_message.setStyleSheet("""
-            QTextEdit {
-                background: #0b1821;
-                color: #dbeafe;
-                border: 1px solid #155e75;
-                border-radius: 14px;
-                padding: 14px;
-                font-size: 14px;
-                font-family: "Segoe UI", Arial;
-            }
-        """)
-        center_layout.addWidget(self.streaming_message)
-
-        # ====================================================
-        # MICRO
-        # ====================================================
-
-        mic_layout = QHBoxLayout()
-        mic_layout.addStretch()
-
-        # Création de la barre audio
-        self.wave = WaveWidget()
-
-        # Bouton dialogue
-        self.dialogue_button = QPushButton()
-        self.dialogue_button.setCheckable(True)
-        self.dialogue_button.setIcon(qta.icon("fa5s.comments", color="#dbeafe"))
-        self.dialogue_button.setIconSize(QSize(17, 17))
-        self.dialogue_button.setFixedSize(46, 46)
-        self.dialogue_button.setToolTip("Activer le mode dialogue continu")
-        self.dialogue_button.setStyleSheet("""
-            QPushButton {
-                background: #172738;
-                border: 1px solid #28506a;
-                border-radius: 12px;
-            }
-
-            QPushButton:hover {
-                background: #1e3a4c;
-                border: 1px solid #22d3ee;
-            }
-
-            QPushButton:checked {
-                background: #22d3ee;
-                border: 1px solid #67e8f9;
-            }
-        """)
-        self.dialogue_button.toggled.connect(self.toggle_dialogue)
-        mic_layout.addWidget(self.dialogue_button)
-
-        mic_layout.addSpacing(10)
-
-        # Bouton veille (mot d'activation)
-        self.veille_button = QPushButton()
-        self.veille_button.setCheckable(True)
-        self.veille_button.setIcon(qta.icon("fa5s.satellite-dish", color="#dbeafe"))
-        self.veille_button.setIconSize(QSize(17, 17))
-        self.veille_button.setFixedSize(46, 46)
-        self.veille_button.setToolTip("Veille : dis \"Jibi\" pour m'activer sans les mains")
-        self.veille_button.setStyleSheet("""
-            QPushButton {
-                background: #172738;
-                border: 1px solid #28506a;
-                border-radius: 12px;
-            }
-
-            QPushButton:hover {
-                background: #1e3a4c;
-                border: 1px solid #22d3ee;
-            }
-
-            QPushButton:checked {
-                background: #22d3ee;
-                border: 1px solid #67e8f9;
-            }
-        """)
-        self.veille_button.toggled.connect(self.toggle_veille)
-        mic_layout.addWidget(self.veille_button)
-
-        mic_layout.addSpacing(14)
-
-        # Micro
-        self.mic_button = QPushButton()
-        self.mic_button.setIcon(qta.icon("fa5s.microphone", color="#ffffff"))
-        self.mic_button.setIconSize(QSize(23, 23))
-        self.mic_button.setFixedSize(64, 64)
-        self.mic_button.setStyleSheet("""
-            QPushButton {
-                background: qlineargradient(
-                    x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #0e7490, stop:1 #22d3ee
-                );
-                border: none;
-                border-radius: 32px;
-                color: white;
-            }
-
-            QPushButton:hover {
-                background: qlineargradient(
-                    x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #0891b2, stop:1 #67e8f9
-                );
-            }
-
-            QPushButton:pressed {
-                background: #0e7490;
-            }
-
-            QPushButton:disabled {
-                background: #334155;
-            }
-        """)
-        self.appliquer_ombre(
-            self.mic_button, flou=28, decalage_y=7, opacite=190, couleur=(34, 211, 238)
-        )
-        self.mic_button.clicked.connect(self.start_listening)
-        mic_layout.addWidget(self.mic_button)
-
-        mic_layout.addStretch()
-        center_layout.addLayout(mic_layout)
-
-        # ====================================================
-        # BARRE AUDIO
-        # ====================================================
-
-        center_layout.addWidget(self.wave)
-
-        # ====================================================
-        # CHAMP TEXTE
-        # ====================================================
-
-        input_layout = QHBoxLayout()
-        input_layout.setSpacing(10)
-
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("Écris un message à JIBI...")
-        self.input.setMinimumHeight(46)
-        self.input.setStyleSheet("""
-            QLineEdit {
-                background: #111d29;
-                color: #dbeafe;
-                border: 1px solid #1e3a4c;
-                border-radius: 12px;
-                padding: 10px 14px;
-                font-size: 14px;
-            }
-
-            QLineEdit:focus {
-                border: 1px solid #22d3ee;
-                background: #102532;
-            }
-
-            QLineEdit::placeholder {
-                color: #64748b;
-            }
-        """)
-        self.input.returnPressed.connect(self.send_text)
-        input_layout.addWidget(self.input)
-
-        self.send_button = QPushButton("Envoyer")
-        self.send_button.setIcon(qta.icon("fa5s.paper-plane", color="#ffffff"))
-        self.send_button.setMinimumHeight(46)
-        self.send_button.setMinimumWidth(115)
-        self.send_button.setStyleSheet("""
-            QPushButton {
-                background: #0e7490;
-                color: white;
-                border: none;
-                border-radius: 12px;
-                padding: 10px 20px;
-                font-weight: bold;
-            }
-
-            QPushButton:hover {
-                background: #22d3ee;
-                color: #001018;
-            }
-
-            QPushButton:pressed {
-                background: #0891b2;
-            }
-
-            QPushButton:disabled {
-                background: #334155;
-                color: #64748b;
-            }
-        """)
-        self.send_button.clicked.connect(self.send_text)
-        input_layout.addWidget(self.send_button)
-
-        center_layout.addLayout(input_layout)
-        layout.addWidget(center, 1)
-
-        self.add_message(
-            "JIBI",
-            "Bonjour 👋 Je suis JIBI, ton assistant IA. Comment puis-je t'aider ?"
-        )
-
-    # ========================================================
-    # MESSAGE
-    # ========================================================
-
-    def add_message(self, auteur, message, is_typing=False):
-        est_utilisateur = auteur == "Vous"
-
-        alignement = "right" if est_utilisateur else "left"
-        couleur_fond = "#0f4c5c" if est_utilisateur else "#162230"
-        couleur_nom = "#7dd3fc" if est_utilisateur else "#22d3ee"
-
-        message_html = (
-            message
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\n", "<br>")
-        )
-
-        if is_typing:
-            message_html += " <span style='color:#22d3ee;'>▌</span>"
-
-        html = f"""
-        <table width="100%" cellspacing="0" cellpadding="0" style="margin:10px 0;">
-            <tr>
-                <td align="{alignement}" style="padding:0 12px;">
-                    <table cellspacing="0" cellpadding="14" style="
-                           background-color:{couleur_fond};
-                           border-radius:16px;
-                           border:1px solid #20384a;">
-                        <tr>
-                            <td>
-                                <b style="color:{couleur_nom}; font-size:11px;">{auteur}</b>
-                                <br>
-                                <span style="color:#e2e8f0; font-size:14px; line-height:1.5;">{message_html}</span>
-                            </td>
-                        </tr>
-                    </table>
-                </td>
-            </tr>
-        </table>
-        """
-
-        self.chat.insertHtml(html)
-
-        cursor = self.chat.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.chat.setTextCursor(cursor)
-
-    # ========================================================
-    # ENVOI TEXTE
-    # ========================================================
-
-    def send_text(self):
-        texte = self.input.text().strip()
-        if not texte:
+        self.chat_view.hide_typing()
+        final = (self._stream_buf + "\n\n(Annulé.)") if self._stream_buf else "(Annulé.)"
+        if self._current_bot_row is not None:
+            self._current_bot_row.replace_streamed(final)
+        else:
+            self.chat_view.add_bot(final, meta=datetime.now().strftime("%H:%M"))
+        self.chat_view.scroll_to_bottom()
+        self._current_bot_row = None
+        self.busy = False
+        self.input_bar.set_busy(False)
+        self.set_status("cancelled")
+        self.root.after(1500, lambda: self.set_status("ready") if not self.busy else None)
+        self.input_bar.focus_input()
+
+    # ================================================== propositions
+    def refresh_props(self):
+        self.props_area.clear()
+        self._prop_rows = {}
+        if not EV_OK or evolution is None:
+            tk.Label(self.props_area.frame,
+                     text="Module d'évolution indisponible\n(core/evolution.py introuvable).",
+                     bg=theme.PANEL, fg=theme.TEXT_FAINT, font=theme.sans(9),
+                     justify="left").pack(anchor="w", padx=10, pady=10)
+            self.sidebar.set_nav_counts(proposals=0)
             return
-
-        self.input.clear()
-        self.add_message("Vous", texte)
-        self.start_agent(texte)
-
-    # ========================================================
-    # VISUEL VOCAL
-    # ========================================================
-
-    def activer_visuel_vocal(self):
-        self.overlay.setGeometry(self.centralWidget().rect())
-        self.wave.set_active(True)
-        self.overlay.orbe.set_active(True)
-        self.overlay.raise_()
-        self.overlay.show()
-
-    def desactiver_visuel_vocal(self):
-        self.wave.set_active(False)
-        self.overlay.orbe.set_active(False)
-        self.overlay.hide()
-
-    def set_niveau_vocal(self, niveau):
-        self.wave.set_level(niveau)
-        self.overlay.orbe.set_level(niveau)
-
-    def fermer_overlay(self):
-        if self.mode_dialogue:
-            self.dialogue_button.setChecked(False)
-        self.desactiver_visuel_vocal()
-
-    # ========================================================
-    # LANCEMENT AGENT
-    # ========================================================
-
-    def start_agent(self, texte):
-
-        if self.agent_worker and self.agent_worker.isRunning():
-            self.status_label.setText("⏳ Patiente, je réponds déjà...")
-            return
-
-        # Empêche d'écraser un voice_worker encore actif (génération ou
-        # lecture audio en cours) — c'est ce qui causait le blocage après
-        # la première réponse : le thread précédent était détruit
-        # brutalement avant d'avoir fini de jouer l'audio, ce qui
-        # bloquait ensuite silencieusement toute nouvelle question.
-        if self.voice_worker and self.voice_worker.isRunning():
-            self.voice_worker.stop_worker()
-            self.voice_worker.wait(2000)
-
-        # Coupe la veille (mot d'activation) AVANT de parler : sans ça,
-        # le sous-processus de veille continuerait d'écouter le micro
-        # pendant que JIBI répond, et risquerait de capter sa propre
-        # voix (potentiellement le mot d'activation lui-même dans la
-        # réponse) puis de se redéclencher tout seul en boucle.
-        if self.wake_worker and self.wake_worker.isRunning():
-            self.wake_worker.arreter()
-            self.wake_worker.wait(2000)
-
-        self.status_label.setText("🧠 Je réfléchis...")
-        self.system_status.setText("● Génération")
-        self.system_status.setStyleSheet("color:#f59e0b;")
-
-        self.input.setEnabled(False)
-        self.send_button.setEnabled(False)
-        self.mic_button.setEnabled(False)
-
-        self.streaming_message.setVisible(True)
-        self.streaming_message.setPlainText("")
-
-        self.current_response = ""
-        self.buffer_vocal = ""
-        self.langue_vocale = "fr"
-        self.dans_bloc_code = False
-
-        self.file_audio = []
-        self.generation_vocale_finie = False
-        self.lecture_en_cours = False
-
-        # Worker vocal AVANT Ollama
-        self.voice_worker = VoiceWorker(self.langue_vocale)
-        self.voice_worker.phrase_pret.connect(self.phrase_audio_prete)
-        self.voice_worker.finished.connect(self.generation_vocale_terminee)
-        self.voice_worker.error.connect(self.voice_error)
-        self.voice_worker.start()
-
-        # Worker agent
-        self.agent_worker = AgentWorker(texte)
-        self.agent_worker.chunk_received.connect(self.on_agent_chunk)
-        self.agent_worker.finished.connect(self.agent_finished)
-        self.agent_worker.error.connect(self.agent_error)
-        self.agent_worker.start()
-
-    # ========================================================
-    # CHUNKS OLLAMA
-    # ========================================================
-
-    def _envoyer_phrase_vocale(self, phrase):
-        """
-        Envoie une phrase déjà nettoyée (jamais du code brut) au
-        VoiceWorker, et met à jour le statut visuel de JIBI.
-        """
-
-        phrase = phrase.strip()
-
-        if not phrase:
-            return
-
-        self.langue_vocale = self.detecter_langue(phrase)
-        self.voice_worker.langue = self.langue_vocale
-        self.voice_worker.ajouter_phrase(phrase)
-
-        if self.status_label.text() == "🧠 Je réfléchis...":
-            self.status_label.setText("🔊 JIBI parle...")
-            self.system_status.setText("● Réponse")
-            self.system_status.setStyleSheet("color:#22d3ee;")
-
-            self.activer_visuel_vocal()
-
-            if not self.speaking_timer:
-                self.speaking_timer = QTimer()
-                self.speaking_timer.timeout.connect(
-                    lambda: self.set_niveau_vocal(random.uniform(0.3, 0.9))
-                )
-
-            self.speaking_timer.start(120)
-
-    def on_agent_chunk(self, chunk):
-        self.current_response += chunk
-        self.update_last_message(self.current_response)
-
-        # L'affichage texte reçoit TOUT le contenu (y compris le code) via
-        # current_response ci-dessus. self.buffer_vocal, lui, ne sert qu'à
-        # préparer ce qui sera réellement prononcé — les blocs ``` en sont
-        # donc exclus, même quand ils arrivent en plusieurs morceaux
-        # successifs pendant le streaming.
-        self.buffer_vocal += chunk
-
-        while True:
-
-            if self.dans_bloc_code:
-
-                idx_fermeture = self.buffer_vocal.find("```")
-
-                if idx_fermeture == -1:
-                    # Bloc de code pas encore refermé : on attend la
-                    # suite du streaming, rien à envoyer à la voix.
-                    break
-
-                # Le contenu du bloc de code est jeté (jamais parlé) ;
-                # on annonce juste oralement qu'il est affiché à l'écran.
-                self.buffer_vocal = self.buffer_vocal[idx_fermeture + 3:]
-                self.dans_bloc_code = False
-                self._envoyer_phrase_vocale("J'ai affiché le code à l'écran.")
-                continue
-
-            idx_ouverture = self.buffer_vocal.find("```")
-
-            position = -1
-
-            for symbole in [".", "!", "?", "。", "！", "？"]:
-                p = self.buffer_vocal.find(symbole)
-                if p != -1:
-                    if position == -1 or p < position:
-                        position = p
-
-            if idx_ouverture != -1 and (position == -1 or idx_ouverture < position):
-                # Un bloc de code démarre avant la prochaine fin de
-                # phrase : on parle d'abord le texte normal qui précède,
-                # puis on bascule en mode "dans un bloc de code".
-                avant = self.buffer_vocal[:idx_ouverture]
-                self._envoyer_phrase_vocale(avant)
-                self.buffer_vocal = self.buffer_vocal[idx_ouverture + 3:]
-                self.dans_bloc_code = True
-                continue
-
-            if position == -1:
-                break
-
-            phrase = self.buffer_vocal[:position + 1]
-            self.buffer_vocal = self.buffer_vocal[position + 1:]
-
-            self._envoyer_phrase_vocale(phrase)
-
-    # ========================================================
-    # AFFICHAGE STREAMING
-    # ========================================================
-
-    def update_last_message(self, texte):
-        self.streaming_message.setVisible(True)
-        self.streaming_message.setPlainText(texte + " ▌")
-
-        cursor = self.streaming_message.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.streaming_message.setTextCursor(cursor)
-
-    # ========================================================
-    # FIN AGENT
-    # ========================================================
-
-    def agent_finished(self, reponse):
-        self.input.setEnabled(True)
-        self.send_button.setEnabled(True)
-
-        self.streaming_message.setVisible(False)
-        self.add_message("JIBI", reponse)
-
-        reste = self.buffer_vocal.strip()
-
-        if reste and self.voice_worker and not self.dans_bloc_code:
-            self.voice_worker.langue = self.detecter_langue(reste)
-            self.voice_worker.ajouter_phrase(reste)
-        elif reste and self.dans_bloc_code:
-            self.voice_worker.ajouter_phrase("J'ai affiché le code à l'écran.")
-
-        self.buffer_vocal = ""
-        self.dans_bloc_code = False
-
-        if self.voice_worker:
-            self.voice_worker.terminer()
-
-        if not self.file_audio and not self.lecture_en_cours:
-            self.status_label.setText("🔊 JIBI parle...")
-
-    # ========================================================
-    # DETECTION LANGUE
-    # ========================================================
-
-    def detecter_langue(self, texte):
-        texte_nettoye = texte.strip()
-
-        # langdetect est peu fiable sous ~15 caractères ou peu de mots
-        # (ce qui arrive souvent : "D'accord.", "Oui bien sûr.", "5 minutes.")
-        # — il classe régulièrement ces phrases courtes comme anglaises
-        # par erreur, ce qui faisait changer la voix Kokoro en plein
-        # milieu d'une réponse française. En dessous de ce seuil, on
-        # part directement sur le français plutôt que de risquer une
-        # mauvaise détection.
-        if len(texte_nettoye) < 15 or len(texte_nettoye.split()) < 4:
-            return "fr"
-
         try:
-            from langdetect import detect
-            langue = detect(texte_nettoye)
-            return "en" if langue == "en" else "fr"
-
+            props = evolution.lister("en_attente") + evolution.lister("tests_echoues")
         except Exception:
-            texte_min = texte_nettoye.lower()
-
-            mots_anglais = [
-                "the", "you", "what", "how", "hello", "your", "with", "this"
-            ]
-
-            score = sum(
-                1 for mot in mots_anglais if f" {mot} " in f" {texte_min} "
-            )
-
-            return "en" if score >= 2 else "fr"
-
-    # ========================================================
-    # AUDIO PRET
-    # ========================================================
-
-    def phrase_audio_prete(self, chemin):
-        if not chemin:
+            props = []
+        self.sidebar.set_nav_counts(proposals=len(props))
+        if not props:
+            tk.Label(self.props_area.frame, text="Aucune proposition en attente.",
+                     bg=theme.PANEL, fg=theme.TEXT_FAINT, font=theme.sans(9)).pack(
+                anchor="w", padx=10, pady=10)
             return
+        for p in props:
+            row = self._make_prop_row(p)
+            row.pack(fill="x", pady=1)
+            self._prop_rows[p.get("id")] = row
+        self.props_area.bind_wheel_recursive()
 
-        self.file_audio.append(chemin)
+    def _make_prop_row(self, prop: dict) -> tk.Frame:
+        statut = prop.get("statut", "?")
+        color = {"appliquee": theme.ACCENT, "restauree": theme.ACCENT,
+                 "rejetee": theme.DANGER, "tests_echoues": theme.DANGER}.get(
+            statut, theme.TEXT_FAINT)
+        row = tk.Frame(self.props_area.frame, bg=theme.PANEL, cursor="hand2")
+        dot = tk.Canvas(row, width=8, height=8, bg=theme.PANEL, highlightthickness=0)
+        dot.create_oval(0, 0, 8, 8, fill=color, outline=color)
+        dot.pack(side="left", padx=(10, 8), pady=12)
+        txt = tk.Frame(row, bg=theme.PANEL)
+        txt.pack(side="left", fill="x", expand=True, pady=8)
+        tk.Label(txt, text=prop.get("fichier", "?"), bg=theme.PANEL, fg=theme.TEXT,
+                 font=theme.sans(10, bold=True), anchor="w").pack(fill="x")
+        tk.Label(txt, text=f"{prop.get('id')} · {statut}", bg=theme.PANEL,
+                 fg=theme.TEXT_FAINT, font=theme.sans(8), anchor="w").pack(fill="x")
 
-        if not self.lecture_en_cours:
-            self._jouer_phrase_suivante()
+        def click(_e=None, p=prop):
+            self._select_prop(p)
 
-    # ========================================================
-    # GENERATION AUDIO TERMINEE
-    # ========================================================
+        for w in (row, dot, txt, *txt.winfo_children()):
+            w.bind("<Button-1>", click)
+        return row
 
-    def generation_vocale_terminee(self):
-        self.generation_vocale_finie = True
+    def _select_prop(self, prop: dict):
+        pid = prop.get("id")
+        self._selected_prop = pid
+        for k, row in self._prop_rows.items():
+            bg = theme.ACCENT_SOFT if k == pid else theme.PANEL
+            self._repaint_row(row, bg)
+        self.diff_title.configure(text=f"{prop.get('fichier', '?')} — {pid}")
 
-        if not self.file_audio and not self.lecture_en_cours:
-            self.voice_finished()
-
-    # ========================================================
-    # LECTURE PHRASE SUIVANTE
-    # ========================================================
-
-    def _jouer_phrase_suivante(self):
-        if not self.file_audio:
-            self.lecture_en_cours = False
-
-            if self.generation_vocale_finie:
-                self.voice_finished()
-
-            return
-
-        self.lecture_en_cours = True
-
-        chemin = self.file_audio.pop(0)
-
-        self.lecteur_audio.setMedia(QMediaContent(QUrl.fromLocalFile(chemin)))
-        self.lecteur_audio.play()
-
-    # ========================================================
-    # FIN AUDIO
-    # ========================================================
-
-    def audio_status_changed(self, statut):
-        if statut == QMediaPlayer.EndOfMedia:
-            self._jouer_phrase_suivante()
-
-    # ========================================================
-    # MODE DIALOGUE
-    # ========================================================
-
-    def toggle_dialogue(self, actif):
-        self.mode_dialogue = actif
-
-        if actif:
-            # Dialogue continu et veille par mot d'activation utilisent
-            # tous les deux le micro en continu : un seul à la fois pour
-            # éviter que deux sous-processus se disputent le périphérique.
-            if self.veille_active:
-                self.veille_button.setChecked(False)
-
-            self.dialogue_button.setStyleSheet("""
-                QPushButton {
-                    background: #22d3ee;
-                    color: #001018;
-                    border: none;
-                    border-radius: 12px;
-                }
-            """)
-
-            self.status_label.setText("Mode dialogue : prêt à écouter")
-
-            if not (self.listening_worker and self.listening_worker.isRunning()):
-                self.start_listening()
-
+        diff = ""
+        if EV_OK and evolution is not None:
+            try:
+                p = evolution.charger(pid) or {}
+                diff = p.get("diff", "")
+            except Exception:
+                diff = ""
+        self.diff_text.configure(state="normal")
+        self.diff_text.delete("1.0", "end")
+        if diff:
+            for line in diff.splitlines(True):
+                tag = None
+                if line.startswith("+") and not line.startswith("+++"):
+                    tag = "add"
+                elif line.startswith("-") and not line.startswith("---"):
+                    tag = "del"
+                elif line.startswith("@@"):
+                    tag = "hunk"
+                self.diff_text.insert("end", line, tag if tag else ())
         else:
-            self.dialogue_button.setStyleSheet("""
-                QPushButton {
-                    background: #172738;
-                    border: 1px solid #28506a;
-                    border-radius: 12px;
-                }
+            self.diff_text.insert("end", "(Aucun diff disponible.)")
+        self.diff_text.configure(state="disabled")
 
-                QPushButton:hover {
-                    background: #1e3a4c;
-                    border: 1px solid #22d3ee;
-                }
+    @staticmethod
+    def _repaint_row(widget, bg):
+        try:
+            widget.configure(bg=bg)
+        except Exception:
+            pass
+        for c in widget.winfo_children():
+            JibiGUI._repaint_row(c, bg)
 
-                QPushButton:checked {
-                    background: #22d3ee;
-                }
-            """)
-
-            self.status_label.setText("Mode dialogue désactivé")
-
-    # ========================================================
-    # VEILLE (MOT D'ACTIVATION)
-    # ========================================================
-
-    def toggle_veille(self, actif):
-        self.veille_active = actif
-
-        if actif:
-            if self.mode_dialogue:
-                self.dialogue_button.setChecked(False)
-
-            self.veille_button.setStyleSheet("""
-                QPushButton {
-                    background: #22d3ee;
-                    color: #001018;
-                    border: none;
-                    border-radius: 12px;
-                }
-            """)
-
-            self.status_label.setText("En veille : dis \"Jibi\" pour m'activer")
-
-            self.start_veille()
-
-        else:
-            if self.wake_worker and self.wake_worker.isRunning():
-                self.wake_worker.arreter()
-
-            self.veille_button.setStyleSheet("""
-                QPushButton {
-                    background: #172738;
-                    border: 1px solid #28506a;
-                    border-radius: 12px;
-                }
-
-                QPushButton:hover {
-                    background: #1e3a4c;
-                    border: 1px solid #22d3ee;
-                }
-
-                QPushButton:checked {
-                    background: #22d3ee;
-                }
-            """)
-
-            self.status_label.setText("Veille désactivée")
-
-    def start_veille(self):
-
-        if not self.veille_active:
+    def _auth_selected(self):
+        if not self._selected_prop:
             return
+        pid = self._selected_prop
+        self.show_view("chat")
+        self.send(f"J'AUTORISE {pid}")
 
-        if self.wake_worker and self.wake_worker.isRunning():
+    def _reject_selected(self):
+        if not self._selected_prop:
             return
+        pid = self._selected_prop
+        self.show_view("chat")
+        self.send(f"JE REJETTE {pid}")
 
-        if self.agent_worker and self.agent_worker.isRunning():
+    # ================================================== panneau d'artefact
+    def _open_code_panel(self, lang: str, code: str):
+        self.artifact_panel.open_artifact(
+            kind="code", title=f"Extrait {lang}", content=code,
+            subtitle=f"{lang} · généré par JIBI")
+
+    def _save_artifact(self, kind: str, title: str, content: str):
+        ext = {"code": ".py", "tool": ".py", "doc": ".md"}.get(kind, ".txt")
+        path = filedialog.asksaveasfilename(defaultextension=ext,
+                                            initialfile=(title or "artefact"))
+        if not path:
             return
+        try:
+            Path(path).write_text(content, encoding="utf-8")
+        except Exception:
+            pass
 
-        # Même garde qu'ailleurs : ne jamais tenir le micro pendant que
-        # JIBI parle encore.
-        if (self.voice_worker and self.voice_worker.isRunning()) or self.lecture_en_cours:
-            return
-
-        self.wake_worker = WakeWordWorker()
-        self.wake_worker.level.connect(self.set_niveau_vocal)
-        self.wake_worker.finished.connect(self.veille_finished)
-        self.wake_worker.error.connect(self.veille_error)
-        self.wake_worker.start()
-
-    def veille_finished(self, texte, langue):
-        if not texte:
-            # Cycles de veille épuisés sans détection : on relance
-            # simplement une nouvelle veille si toujours active.
-            if self.veille_active:
-                QTimer.singleShot(500, self.start_veille)
-            return
-
-        log_event("ui", f"Réveil détecté: {texte[:30]}...")
-
-        self.add_message("Vous", texte)
-        self.start_agent(texte)
-
-    def veille_error(self, erreur):
-        log_error("ui", f"Wake word error: {erreur}", exc_info=False)
-
-        if self.veille_active:
-            self.status_label.setText("Erreur veille — désactivée")
-            self.veille_button.setChecked(False)
-
-    # ========================================================
-    # ECOUTE
-    # ========================================================
-
-    def start_listening(self):
-
-        if self.listening_worker and self.listening_worker.isRunning():
-            return
-
-        if self.agent_worker and self.agent_worker.isRunning():
-            self.status_label.setText("⏳ Patiente, je réponds déjà...")
-            return
-
-        # Même protection ici : évite de démarrer une écoute pendant
-        # que JIBI est encore en train de générer/jouer sa réponse vocale
-        # (sinon le VoiceWorker en cours serait écrasé silencieusement
-        # au prochain start_agent, provoquant le même blocage).
-        #
-        # On vérifie aussi lecture_en_cours directement : le thread
-        # voice_worker peut avoir fini de GÉNÉRER l'audio (isRunning()
-        # devient False) alors que la DERNIÈRE phrase est encore en
-        # train de JOUER via QMediaPlayer. Sans ce deuxième test, un
-        # clic micro dans cette fenêtre lancerait l'écoute pendant que
-        # JIBI parle encore, avec le risque qu'il s'entende lui-même.
-        if (self.voice_worker and self.voice_worker.isRunning()) or self.lecture_en_cours:
-            self.status_label.setText("⏳ Patiente, JIBI parle encore...")
-            return
-
-        # Une seule source ne peut tenir le micro à la fois : on coupe
-        # la veille avant une écoute manuelle plutôt que de laisser les
-        # deux sous-processus se disputer le périphérique audio.
-        if self.wake_worker and self.wake_worker.isRunning():
-            self.wake_worker.arreter()
-            self.wake_worker.wait(2000)
-
-        self.status_label.setText("🎤 J'écoute...")
-        self.system_status.setText("● Écoute")
-        self.system_status.setStyleSheet("color:#22d3ee;")
-
-        self.mic_button.setEnabled(False)
-        self.activer_visuel_vocal()
-
-        self.listening_worker = ListeningWorker()
-        self.listening_worker.level.connect(self.set_niveau_vocal)
-        self.listening_worker.finished.connect(self.listening_finished)
-        self.listening_worker.error.connect(self.listening_error)
-        self.listening_worker.start()
-
-    # ========================================================
-    # FIN ECOUTE
-    # ========================================================
-
-    def listening_finished(self, texte, langue):
-        log_event(
-            "ui", f"Mic: {texte[:30] if texte else '(silence)'}... ({langue})"
+    def _show_settings_stub(self):
+        content = (
+            "Paramètres\n\n"
+            "Cette section affichera bientôt le choix du modèle, le thème, "
+            "les raccourcis clavier et l'emplacement des sauvegardes.\n\n"
+            "Pour changer de modèle aujourd'hui : variables d'environnement "
+            "JIBI_LLM_URL / JIBI_LLM_MODEL (voir cerveau.py)."
         )
+        self.artifact_panel.open_artifact(kind="doc", title="Paramètres",
+                                          content=content, subtitle="JIBI Aurora")
 
-        self.desactiver_visuel_vocal()
-        self.mic_button.setEnabled(True)
+    # ================================================== saisie
+    def _on_suggestion(self, label: str):
+        self.send(label)
 
-        if not texte:
-            self.status_label.setText("Aucune parole")
-            self.system_status.setText("● Prêt")
-            self.system_status.setStyleSheet("color:#22c55e;")
+    def _on_attach(self):
+        path = filedialog.askopenfilename()
+        if path:
+            # Pas encore relié à l'agent : indication visuelle seulement.
+            self.input_bar.set_attach_badge(f"Joint : {Path(path).name}")
 
-            if self.mode_dialogue:
-                QTimer.singleShot(600, self.start_listening)
+    def _on_mic(self, on: bool):
+        self.input_bar.set_listening(on)
+        # Intégration Parakeet (dictée) à brancher ici.
 
-            return
+    # ================================================== cycle de vie
+    def _on_close(self):
+        try:
+            self.state.set(geometry=self.root.geometry())
+            self.state.save()
+        except Exception:
+            pass
+        self.root.destroy()
 
-        self.add_message("Vous", texte)
-        self.start_agent(texte)
-
-    # ========================================================
-    # FIN JIBI PARLE
-    # ========================================================
-
-    def voice_finished(self):
-        if self.speaking_timer:
-            self.speaking_timer.stop()
-
-        self.desactiver_visuel_vocal()
-
-        # Bug pré-existant : mic_button était désactivé dans start_agent
-        # mais jamais réactivé ici. Ça n'était pas visible en mode
-        # dialogue (le mic reste géré par listening_finished juste
-        # après), mais bloquait le micro après une réponse à un
-        # message tapé au clavier.
-        self.mic_button.setEnabled(True)
-
-        self.status_label.setText("Prêt à converser")
-        self.system_status.setText("● Prêt")
-        self.system_status.setStyleSheet("color:#22c55e;")
-
-        if self.mode_dialogue:
-            QTimer.singleShot(500, self.start_listening)
-        elif self.veille_active:
-            # Redonne le micro à la veille maintenant que JIBI a fini
-            # de parler — c'est le pendant du arrêt fait dans start_agent.
-            QTimer.singleShot(500, self.start_veille)
-
-    # ========================================================
-    # ERREUR MICRO
-    # ========================================================
-
-    def listening_error(self, erreur):
-        log_error("ui", f"Microphone error: {erreur}", exc_info=False)
-
-        self.desactiver_visuel_vocal()
-        self.mic_button.setEnabled(True)
-
-        self.status_label.setText("Erreur microphone")
-        self.system_status.setText("● Erreur")
-        self.system_status.setStyleSheet("color:#ef4444;")
-
-        self.add_message("JIBI", f"Erreur microphone : {erreur}")
-
-        if self.mode_dialogue:
-            self.dialogue_button.setChecked(False)
-
-    # ========================================================
-    # ERREUR AGENT
-    # ========================================================
-
-    def agent_error(self, erreur):
-        log_error("ui", f"Agent error: {erreur}", exc_info=False)
-
-        self.input.setEnabled(True)
-        self.send_button.setEnabled(True)
-        self.mic_button.setEnabled(True)
-
-        self.streaming_message.setVisible(False)
-
-        self.status_label.setText("Erreur JIBI")
-        self.system_status.setText("● Erreur")
-        self.system_status.setStyleSheet("color:#ef4444;")
-
-        self.add_message("JIBI", f"Erreur : {erreur}")
-
-    # ========================================================
-    # ERREUR VOIX
-    # ========================================================
-
-    def voice_error(self, erreur):
-        log_error("ui", f"Voice error: {erreur}", exc_info=False)
-
-        if self.speaking_timer:
-            self.speaking_timer.stop()
-
-        self.desactiver_visuel_vocal()
-
-        self.file_audio = []
-        self.generation_vocale_finie = True
-        self.lecture_en_cours = False
-
-        # Bug : contrairement à agent_error, mic_button n'était jamais
-        # réactivé ici. Si la synthèse vocale (Kokoro) échoue une seule
-        # fois, le bouton micro restait désactivé pour toujours — un
-        # clic dessus ne déclenche alors plus rien du tout (aucun
-        # événement n'est émis par un bouton désactivé), symptôme
-        # exact de "je clique et rien ne se passe".
-        self.mic_button.setEnabled(True)
-
-        self.status_label.setText("Réponse affichée")
-        self.system_status.setText("● Prêt")
-        self.system_status.setStyleSheet("color:#22c55e;")
-
-    # ========================================================
-    # NOUVELLE CONVERSATION
-    # ========================================================
-
-    def clear_chat(self):
-        self.chat.clear()
-        self.add_message("JIBI", "Nouvelle conversation démarrée 👋 C'est reparti !")
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    app = QApplication(sys.argv)
-
-    apply_stylesheet(app, theme="dark_cyan.xml")
-
-    window = AgentWindow()
-    window.show()
-
-    sys.exit(app.exec_())
+    def run(self):
+        self.root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    print(">>> JIBI AURORA STARTING...")
+    app = JibiGUI()
+    app.run()

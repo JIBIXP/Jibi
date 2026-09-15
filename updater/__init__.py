@@ -1,48 +1,51 @@
 """
-Package updater de JIBI.
-
-L'import de ce package enregistre automatiquement les outils de mise
-à jour dans le MÊME registre que tools/ (tool_registry.TOOLS_REGISTRY),
-pour qu'ils soient exposés au function-calling d'Ollama sans dupliquer
-les définitions à la main. Voir tools/__init__.py pour le même schéma.
+Module Updater — PATCHÉ v2 (inchangé, imports conditionnels conservés)
 """
+__version__ = "2.0.0"
 
-from . import checker
-from . import updater
-from . import rollback
+try:
+    from . import checker
+    CHECKER_OK = True
+except ImportError:
+    checker = None
+    CHECKER_OK = False
 
-from tools.tool_registry import register_tool
+try:
+    from . import git_manager
+    GIT_MANAGER_OK = True
+except ImportError:
+    git_manager = None
+    GIT_MANAGER_OK = False
 
+try:
+    from . import rollback
+    ROLLBACK_OK = True
+except ImportError:
+    rollback = None
+    ROLLBACK_OK = False
 
-register_tool(
-    "verifier_mise_a_jour",
-    checker.verifier_mise_a_jour,
-    "Vérifie (lecture seule) si une mise à jour de JIBI est disponible "
-    "sur le dépôt git distant.",
-)
+try:
+    from . import test_runner
+    TEST_RUNNER_OK = True
+except ImportError:
+    test_runner = None
+    TEST_RUNNER_OK = False
 
-register_tool(
-    "appliquer_mise_a_jour",
-    updater.appliquer_mise_a_jour,
-    "Applique la dernière mise à jour disponible de JIBI (confirmation "
-    "utilisateur requise). Crée automatiquement une sauvegarde avant "
-    "toute modification et annule si l'opération échoue.",
-    {
-        "type": "object",
-        "properties": {},
-        "required": []
+try:
+    from . import updater as updater_module
+    UPDATER_MODULE_OK = True
+except ImportError:
+    updater_module = None
+    UPDATER_MODULE_OK = False
+
+def get_version():
+    return __version__
+
+def verifier_modules():
+    return {
+        "checker": CHECKER_OK,
+        "git_manager": GIT_MANAGER_OK,
+        "rollback": ROLLBACK_OK,
+        "test_runner": TEST_RUNNER_OK,
+        "updater": UPDATER_MODULE_OK,
     }
-)
-
-register_tool(
-    "restaurer_derniere_sauvegarde",
-    rollback.restaurer_derniere_sauvegarde,
-    "Restaure le code de JIBI à partir de la dernière sauvegarde "
-    "connue, annulant la dernière mise à jour (confirmation "
-    "utilisateur requise).",
-    {
-        "type": "object",
-        "properties": {},
-        "required": []
-    }
-)

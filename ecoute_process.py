@@ -1,10 +1,8 @@
-import io
-import json
-import os
 import sys
+import json
+import io
 import wave
-
-import numpy as np
+import requests
 
 from voix import (
     FREQUENCE,
@@ -12,96 +10,75 @@ from voix import (
     transcrire_audio
 )
 
-from logging_jibi import (
-    log_event,
-    log_warning
-)
-
 
 # ============================================================
-# SERVEUR LOCAL
+# SERVEUR DE MODÈLES LOCAL
 # ============================================================
 
 URL_SERVEUR_MODELES = "http://127.0.0.1:8765"
 
 
 # ============================================================
-# MOT D'ACTIVATION (VEILLE)
+# COMMUNICATION AVEC LE GUI
 # ============================================================
 
-MOT_ACTIVATION = os.getenv("JIBI_MOT_ACTIVATION", "jibi").strip().lower()
-
-# Sécurité anti-boucle infinie en mode veille : nombre max de cycles
-# d'écoute sans détection avant d'abandonner (le GUI relance ensuite
-# un nouveau processus veille s'il le souhaite toujours).
-VEILLE_CYCLES_MAX = int(os.getenv("JIBI_VEILLE_CYCLES_MAX", "10000"))
-
-
-def _contient_mot_activation(texte):
-    return MOT_ACTIVATION in texte.lower()
-
-
-def _extraire_commande(texte):
+def envoyer(message):
     """
-    Retire le mot d'activation du texte transcrit et renvoie ce qui
-    reste (la commande). Gère aussi les formes "Jibi," / "Dis Jibi".
+    Envoie un message JSON au GUI.
     """
 
-    import re
+    try:
 
-    nettoye = re.sub(
-        rf"\bdis\s+{re.escape(MOT_ACTIVATION)}\b",
-        "",
-        texte,
-        flags=re.IGNORECASE
-    )
+        print(
+            json.dumps(
+                message,
+                ensure_ascii=False
+            ),
+            flush=True
+        )
 
-    nettoye = re.sub(
-        rf"\b{re.escape(MOT_ACTIVATION)}\b",
-        "",
-        nettoye,
-        flags=re.IGNORECASE
-    )
+    except Exception as e:
 
-    nettoye = nettoye.strip(" ,.!?:;-")
-
-    return " ".join(nettoye.split())
+        print(
+            json.dumps(
+                {
+                    "type": "erreur",
+                    "message": str(e)
+                },
+                ensure_ascii=False
+            ),
+            flush=True
+        )
 
 
 # ============================================================
 # AUDIO -> WAV
 # ============================================================
 
-def _audio_vers_wav_bytes(
-    audio_np,
-    frequence
-):
+def audio_en_wav(audio_np):
     """
-    Transforme un tableau audio numpy en WAV
-    mono PCM 16 bits.
+    Convertit le tableau audio int16 en WAV
+    directement en mémoire.
     """
 
-    audio_np = np.asarray(
-        audio_np,
-        dtype=np.int16
-    ).reshape(-1)
-
-    tampon = io.BytesIO()
+    buffer = io.BytesIO()
 
     with wave.open(
-        tampon,
+        buffer,
         "wb"
-    ) as f:
+    ) as wav:
 
-        f.setnchannels(1)
-        f.setsampwidth(2)
-        f.setframerate(frequence)
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(FREQUENCE)
 
-        f.writeframes(
+        wav.writeframes(
             audio_np.tobytes()
         )
 
-    return tampon.getvalue()
+    buffer.seek(0)
+
+    return buffer
 
 
 # ============================================================
@@ -110,51 +87,30 @@ def _audio_vers_wav_bytes(
 
 def transcrire(audio_np):
     """
-    Essaie d'abord le serveur Parakeet local.
+    Essaie d'abord le serveur local.
 
-    Si le serveur n'est pas disponible :
-    -> utilise directement Parakeet dans ce processus.
+    Si le serveur n'est pas disponible,
+    utilise Parakeet directement dans ce processus.
     """
 
-    if (
-        audio_np is None
-        or len(audio_np) == 0
-    ):
+    if audio_np is None:
+        return "", "fr"
 
-        return (
-            "",
-            "fr"
-        )
+    wav_buffer = audio_en_wav(
+        audio_np
+    )
 
     try:
 
-        import requests
-
-        donnees_wav = (
-            _audio_vers_wav_bytes(
-                audio_np,
-                FREQUENCE
-            )
-        )
-
-        # ----------------------------------------------------
-        # Serveur STT local
-        # ----------------------------------------------------
-
         reponse = requests.post(
-
             f"{URL_SERVEUR_MODELES}/transcrire",
-
             files={
                 "fichier": (
                     "audio.wav",
-                    donnees_wav,
+                    wav_buffer,
                     "audio/wav"
                 )
             },
-
-            # 20 s suffit largement pour une transcription
-            # normale. Le fallback sera déclenché plus tôt.
             timeout=20
         )
 
@@ -169,78 +125,43 @@ def transcrire(audio_np):
             )
         ).strip()
 
-        langue = str(
-            data.get(
-                "langue",
-                "fr"
-            )
+        langue = data.get(
+            "langue",
+            "fr"
         )
 
-        log_event(
-            "stt",
-            f"Serveur : {texte[:80]}"
-        )
-
-        return (
-            texte,
-            langue
-        )
-
-    # ========================================================
-    # SERVEUR ABSENT
-    # ========================================================
+        return texte, langue
 
     except requests.exceptions.ConnectionError:
 
         print(
-            "⚠️ Serveur STT indisponible → "
-            "Parakeet local"
-        )
-
-        log_warning(
-            "stt",
-            "Serveur indisponible, fallback local"
+            "⚠️ Serveur modèles indisponible."
+            " Parakeet local utilisé.",
+            flush=True
         )
 
         return transcrire_audio(
             audio_np
         )
-
-    # ========================================================
-    # SERVEUR TROP LENT
-    # ========================================================
 
     except requests.exceptions.Timeout:
 
         print(
-            "⚠️ Serveur STT trop lent → "
-            "Parakeet local"
-        )
-
-        log_warning(
-            "stt",
-            "Serveur timeout, fallback local"
+            "⚠️ Timeout serveur."
+            " Parakeet local utilisé.",
+            flush=True
         )
 
         return transcrire_audio(
             audio_np
         )
-
-    # ========================================================
-    # AUTRE ERREUR
-    # ========================================================
 
     except Exception as e:
 
         print(
-            "⚠️ Erreur serveur STT "
-            f"({type(e).__name__}) → "
-            "Parakeet local"
-        )
-
-        log_warning(
-            "stt",
-            f"Serveur error ({type(e).__name__})"
+            f"⚠️ Erreur serveur : {e}. "
+            "Parakeet local utilisé.",
+            flush=True
         )
 
         return transcrire_audio(
@@ -249,227 +170,212 @@ def transcrire(audio_np):
 
 
 # ============================================================
-# ENVOI JSON VERS GUI
+# ÉCOUTE NORMALE
 # ============================================================
 
-def envoyer_json(
-    donnees
-):
-    """
-    Envoie une ligne JSON au GUI.
+def ecouter_normal():
 
-    IMPORTANT :
-    flush=True permet au GUI de recevoir
-    immédiatement les informations.
-    """
+    envoyer(
+        {
+            "type": "ecoute",
+            "etat": "active"
+        }
+    )
 
-    print(
-        json.dumps(
-            donnees,
-            ensure_ascii=False
-        ),
-        flush=True
+    audio = ecouter_jusqua_silence(
+        silence_max_ms=900,
+        sensibilite=2,
+        duree_max_s=12
+    )
+
+    if audio is None:
+
+        envoyer(
+            {
+                "type": "transcription",
+                "texte": "",
+                "langue": "fr"
+            }
+        )
+
+        envoyer(
+            {
+                "type": "ecoute",
+                "etat": "terminee"
+            }
+        )
+
+        return
+
+    texte, langue = transcrire(
+        audio
+    )
+
+    envoyer(
+        {
+            "type": "transcription",
+            "texte": texte,
+            "langue": langue
+        }
+    )
+
+    envoyer(
+        {
+            "type": "ecoute",
+            "etat": "terminee"
+        }
     )
 
 
 # ============================================================
-# PROGRAMME PRINCIPAL
+# MODE VEILLE
 # ============================================================
 
-if __name__ == "__main__":
+def ecouter_veille():
 
-    MODE_VEILLE = "--veille" in sys.argv
+    envoyer(
+        {
+            "type": "ecoute",
+            "etat": "veille"
+        }
+    )
 
-    # --------------------------------------------------------
-    # Niveau microphone
-    # --------------------------------------------------------
+    audio = ecouter_jusqua_silence(
+        silence_max_ms=700,
+        sensibilite=2,
+        duree_max_s=6
+    )
 
-    def envoyer_niveau(
-        niveau
-    ):
+    if audio is None:
 
-        envoyer_json(
+        envoyer(
             {
-                "level": float(
-                    niveau
+                "type": "veille",
+                "texte": "",
+                "langue": "fr"
+            }
+        )
+
+        return
+
+    texte, langue = transcrire(
+        audio
+    )
+
+    envoyer(
+        {
+            "type": "veille",
+            "texte": texte,
+            "langue": langue
+        }
+    )
+
+
+# ============================================================
+# NIVEAU MICRO
+# ============================================================
+
+def ecouter_niveau():
+
+    envoyer(
+        {
+            "type": "ecoute",
+            "etat": "active"
+        }
+    )
+
+    def on_level(niveau):
+
+        envoyer(
+            {
+                "type": "niveau",
+                "valeur": niveau
+            }
+        )
+
+    audio = ecouter_jusqua_silence(
+        silence_max_ms=900,
+        sensibilite=2,
+        duree_max_s=12,
+        on_level=on_level
+    )
+
+    if audio is None:
+
+        envoyer(
+            {
+                "type": "transcription",
+                "texte": "",
+                "langue": "fr"
+            }
+        )
+
+        envoyer(
+            {
+                "type": "ecoute",
+                "etat": "terminee"
+            }
+        )
+
+        return
+
+    texte, langue = transcrire(
+        audio
+    )
+
+    envoyer(
+        {
+            "type": "transcription",
+            "texte": texte,
+            "langue": langue
+        }
+    )
+
+    envoyer(
+        {
+            "type": "ecoute",
+            "etat": "terminee"
+        }
+    )
+
+
+# ============================================================
+# BOUCLE PRINCIPALE
+# ============================================================
+
+def main():
+
+    if len(sys.argv) < 2:
+
+        envoyer(
+            {
+                "type": "erreur",
+                "message": (
+                    "Mode d'écoute manquant."
                 )
             }
         )
 
-    # ============================================================
-    # MODE VEILLE : boucle jusqu'au mot d'activation
-    # ============================================================
+        return
 
-    if MODE_VEILLE:
+    mode = sys.argv[1].lower()
 
-        envoyer_json(
-            {
-                "status": "veille",
-                "mot_activation": MOT_ACTIVATION
-            }
-        )
+    if mode == "veille":
 
-        log_event(
-            "veille",
-            f"Démarrage veille (mot: '{MOT_ACTIVATION}')"
-        )
+        ecouter_veille()
 
-        for _ in range(VEILLE_CYCLES_MAX):
+    elif mode == "niveau":
 
-            # Écoute courte : on ne veut pas bloquer 12s à chaque
-            # cycle juste pour repérer un mot d'activation.
-            audio = ecouter_jusqua_silence(
-                silence_max_ms=700,
-                sensibilite=2,
-                duree_max_s=6,
-                on_level=envoyer_niveau
-            )
-
-            if audio is None:
-                continue
-
-            texte, langue = transcrire(audio)
-            texte = " ".join(str(texte or "").strip().split())
-
-            if not texte:
-                continue
-
-            if not _contient_mot_activation(texte):
-                # Pas le mot d'activation : on ignore et on
-                # recommence à écouter, sans rien remonter au GUI.
-                continue
-
-            commande = _extraire_commande(texte)
-
-            log_event(
-                "veille",
-                f"Mot d'activation détecté, commande: {commande[:60]!r}"
-            )
-
-            envoyer_json(
-                {
-                    "texte": commande,
-                    "langue": langue or "fr",
-                    "reveil": True
-                }
-            )
-
-            break
-
-        else:
-
-            # VEILLE_CYCLES_MAX atteint sans détection : on remonte
-            # un résultat vide, le GUI décide s'il relance la veille.
-            envoyer_json(
-                {
-                    "texte": "",
-                    "langue": "",
-                    "reveil": True
-                }
-            )
-
-    # ============================================================
-    # MODE NORMAL : une seule écoute, comme avant
-    # ============================================================
+        ecouter_niveau()
 
     else:
 
-        # --------------------------------------------------------
-        # Indique au GUI que l'écoute commence
-        # --------------------------------------------------------
+        ecouter_normal()
 
-        envoyer_json(
-            {
-                "status": "ecoute"
-            }
-        )
 
-        # --------------------------------------------------------
-        # Écoute
-        # --------------------------------------------------------
+# ============================================================
+# LANCEMENT
+# ============================================================
 
-        audio = ecouter_jusqua_silence(
-
-            # 900 ms maximum de silence
-            # avant de considérer la phrase terminée
-            silence_max_ms=900,
-
-            # Sensibilité WebRTC
-            sensibilite=2,
-
-            # Sécurité : maximum 12 secondes
-            duree_max_s=12,
-
-            # Mise à jour du niveau microphone
-            on_level=envoyer_niveau
-        )
-
-        # ========================================================
-        # RIEN N'A ÉTÉ DÉTECTÉ
-        # ========================================================
-
-        if audio is None:
-
-            envoyer_json(
-                {
-                    "texte": "",
-                    "langue": ""
-                }
-            )
-
-        # ========================================================
-        # AUDIO DÉTECTÉ
-        # ========================================================
-
-        else:
-
-            duree = (
-                len(audio)
-                / FREQUENCE
-            )
-
-            envoyer_json(
-                {
-                    "status": "transcription",
-                    "duree": round(
-                        duree,
-                        2
-                    )
-                }
-            )
-
-            # ----------------------------------------------------
-            # Transcription
-            # ----------------------------------------------------
-
-            texte, langue = transcrire(
-                audio
-            )
-
-            # ----------------------------------------------------
-            # Nettoyage final
-            # ----------------------------------------------------
-
-            texte = str(
-                texte or ""
-            ).strip()
-
-            # Évite les espaces multiples
-            texte = " ".join(
-                texte.split()
-            )
-
-            langue = str(
-                langue or "fr"
-            ).strip()
-
-            # ----------------------------------------------------
-            # Résultat vers GUI
-            # ----------------------------------------------------
-
-            envoyer_json(
-                {
-                    "texte": texte,
-                    "langue": langue
-                }
-            )
+if __name__ == "__main__":
+    main()

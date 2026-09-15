@@ -1,1026 +1,807 @@
-import atexit
 import os
-import re
-import shutil
-import tempfile
-import uuid
+import threading
+import queue
 import time
+from pathlib import Path
+from typing import Optional, Callable
+from dotenv import load_dotenv
+from logging_jibi import log_event, log_warning, log_error
 
-import numpy as np
-import sounddevice as sd
-import torch
-import webrtcvad
-
-from logging_jibi import log_event, log_error
-
+load_dotenv(override=True)
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION VOCALE
 # ============================================================
 
-FREQUENCE = 16000
-DUREE_TRAME_MS = 30
+# TTS (Text-To-Speech)
+TTS_ENGINE = os.getenv("TTS_ENGINE", "pyttsx3")  # pyttsx3, gTTS, edge-tts
+TTS_ACTIVE = os.getenv("TTS_ACTIVE", "1") == "1"
+TTS_VOICE_ID = os.getenv("TTS_VOICE_ID", "")  # ID voix spécifique (optionnel)
+TTS_RATE = int(os.getenv("TTS_RATE", "150"))  # Vitesse parole (mots/min)
+TTS_VOLUME = float(os.getenv("TTS_VOLUME", "0.9"))  # Volume (0.0-1.0)
+TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", "fr-FR")
 
-# Pré-roll : récupère les premières syllabes
-PRE_ROLL_MS = 240
+# STT (Speech-To-Text)
+STT_ENGINE = os.getenv("STT_ENGINE", "google")  # google, whisper, sphinx
+STT_ACTIVE = os.getenv("STT_ACTIVE", "0") == "1"
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "fr-FR")
+STT_TIMEOUT = int(os.getenv("STT_TIMEOUT", "5"))  # Timeout écoute (secondes)
+STT_PHRASE_LIMIT = int(os.getenv("STT_PHRASE_LIMIT", "15"))  # Durée max phrase
 
-# Temps de silence avant arrêt
-# 900 ms = plus réactif que 1200 ms
-POST_ROLL_MS = 300
-SILENCE_MAX_MS = 900
+# Performance
+TTS_ASYNC = os.getenv("TTS_ASYNC", "1") == "1"  # Synthèse asynchrone (non-bloquante)
+TTS_CACHE_ACTIVE = os.getenv("TTS_CACHE_ACTIVE", "1") == "1"  # Cache audio
+MAX_CACHE_SIZE = int(os.getenv("MAX_CACHE_SIZE", "50"))  # Nombre fichiers cache
 
-TAILLE_TRAME = int(
-    FREQUENCE * DUREE_TRAME_MS / 1000
-)
-
-
-# ============================================================
-# DOSSIER TEMPORAIRE AUDIO
-# ============================================================
-
-_TEMP_AUDIO_DIR = tempfile.mkdtemp(
-    prefix="jibi_audio_"
-)
-
-
-def _nettoyer_audio_temp():
-    """Nettoie les fichiers audio temporaires à la fermeture."""
-    try:
-        if os.path.isdir(_TEMP_AUDIO_DIR):
-            shutil.rmtree(_TEMP_AUDIO_DIR)
-    except Exception as e:
-        print(f"Erreur nettoyage audio : {e}")
-
-
-atexit.register(_nettoyer_audio_temp)
-
+# Chemins
+WORKSPACE_DIR = Path(os.getenv("JIBI_PROJET_DIR", Path(__file__).parent.parent)) / "workspace"
+CACHE_AUDIO_DIR = WORKSPACE_DIR / "cache_audio"
+CACHE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================
-# PARAKEET
+# IMPORTS CONDITIONNELS (évite crash si bibliothèques manquantes)
 # ============================================================
 
-PARAKEET_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
+_pyttsx3_disponible = False
+_gtts_disponible = False
+_edge_tts_disponible = False
+_speech_recognition_disponible = False
+_whisper_disponible = False
 
-_modele_parakeet = None
+try:
+    import pyttsx3
+    _pyttsx3_disponible = True
+except ImportError:
+    log_warning("voix", "pyttsx3 non installé (pip install pyttsx3)")
+
+try:
+    from gtts import gTTS
+    import pygame
+    _gtts_disponible = True
+except ImportError:
+    log_warning("voix", "gTTS non installé (pip install gtts pygame)")
+
+try:
+    import edge_tts
+    import asyncio
+    _edge_tts_disponible = True
+except ImportError:
+    log_warning("voix", "edge-tts non installé (pip install edge-tts)")
+
+try:
+    import speech_recognition as sr
+    _speech_recognition_disponible = True
+except ImportError:
+    log_warning("voix", "SpeechRecognition non installé (pip install SpeechRecognition pyaudio)")
+
+try:
+    import whisper
+    _whisper_disponible = True
+except ImportError:
+    log_warning("voix", "Whisper non installé (pip install openai-whisper)")
+
+# ============================================================
+# CACHE AUDIO (évite synthèse répétée = 10× plus rapide)
+# ============================================================
+
+_cache_audio = {}  # {hash(texte): chemin_fichier}
+_stats_voix = {
+    "tts_total": 0,
+    "tts_cache_hits": 0,
+    "tts_cache_misses": 0,
+    "stt_total": 0,
+    "stt_success": 0,
+    "stt_echecs": 0
+}
 
 
-def get_modele_parakeet():
-    """
-    Charge Parakeet une seule fois.
+def _obtenir_hash_texte(texte: str) -> str:
+    """Hash MD5 du texte pour nom fichier cache."""
+    import hashlib
+    return hashlib.md5(texte.encode('utf-8')).hexdigest()[:16]
 
-    Le modèle reste ensuite en mémoire pour éviter
-    de le recharger à chaque phrase.
-    """
 
-    global _modele_parakeet
-
-    if _modele_parakeet is not None:
-        return _modele_parakeet
-
-    print("🧠 Chargement de Parakeet...")
-
-    from transformers import pipeline
-
-    if torch.cuda.is_available():
-        device = 0
-        dtype = torch.float16
-
-        print("🎮 Parakeet : GPU NVIDIA détecté")
-
-    else:
-        device = -1
-        dtype = torch.float32
-
-        print("💻 Parakeet : CPU")
-
-    _modele_parakeet = pipeline(
-        "automatic-speech-recognition",
-        model=PARAKEET_MODEL,
-        device=device,
-        torch_dtype=dtype
+def _nettoyer_cache_audio():
+    """Supprime vieux fichiers cache si limite dépassée."""
+    fichiers = sorted(
+        CACHE_AUDIO_DIR.glob("*.mp3"),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True
     )
-
-    print("✅ Parakeet prêt.")
-
-    return _modele_parakeet
-
-
-# ============================================================
-# VOLUME MICROPHONE
-# ============================================================
-
-def calculer_volume(trame):
-    """Calcule un niveau sonore normalisé entre 0 et 1."""
-
-    audio = trame.astype(np.float32)
-
-    volume = np.sqrt(
-        np.mean(audio ** 2)
-    )
-
-    return float(
-        min(volume / 5000.0, 1.0)
-    )
+    
+    if len(fichiers) > MAX_CACHE_SIZE:
+        for fichier in fichiers[MAX_CACHE_SIZE:]:
+            try:
+                fichier.unlink()
+                log_event("voix", f"Cache audio supprimé: {fichier.name}")
+            except Exception as e:
+                log_warning("voix", f"Erreur suppression cache: {e}")
 
 
-# ============================================================
-# WARMUP VAD
-# ============================================================
-
-def _warmer_vad():
-    """
-    Initialise WebRTC VAD une première fois
-    afin de réduire le délai au premier lancement.
-    """
-
-    try:
-        vad = webrtcvad.Vad(2)
-
-        silence = np.zeros(
-            TAILLE_TRAME,
-            dtype=np.int16
-        )
-
-        vad.is_speech(
-            silence.tobytes(),
-            FREQUENCE
-        )
-
-    except Exception:
-        pass
+def _obtenir_fichier_cache(texte: str) -> Optional[Path]:
+    """Récupère fichier cache audio s'il existe."""
+    if not TTS_CACHE_ACTIVE:
+        return None
+    
+    hash_texte = _obtenir_hash_texte(texte)
+    
+    # Vérifier mémoire
+    if hash_texte in _cache_audio:
+        fichier = Path(_cache_audio[hash_texte])
+        if fichier.exists():
+            _stats_voix["tts_cache_hits"] += 1
+            return fichier
+    
+    # Vérifier disque
+    fichier = CACHE_AUDIO_DIR / f"{hash_texte}.mp3"
+    if fichier.exists():
+        _cache_audio[hash_texte] = str(fichier)
+        _stats_voix["tts_cache_hits"] += 1
+        return fichier
+    
+    _stats_voix["tts_cache_misses"] += 1
+    return None
 
 
-_warmer_vad()
+def _sauvegarder_cache(texte: str, fichier: Path):
+    """Enregistre fichier audio dans cache."""
+    if not TTS_CACHE_ACTIVE:
+        return
+    
+    hash_texte = _obtenir_hash_texte(texte)
+    _cache_audio[hash_texte] = str(fichier)
+    _nettoyer_cache_audio()
 
 
 # ============================================================
-# ÉCOUTE
+# TTS (TEXT-TO-SPEECH) - Synthèse vocale
 # ============================================================
 
-def ecouter_jusqua_silence(
-    silence_max_ms=SILENCE_MAX_MS,
-    sensibilite=1,
-    duree_max_s=15,
-    on_level=None
-):
-    """
-    Écoute le microphone jusqu'à détection d'un silence.
+_tts_engine_pyttsx3 = None
+_tts_queue = queue.Queue()
+_tts_thread = None
+_tts_thread_active = False
 
-    Optimisations :
-    - VAD WebRTC
-    - calibration rapide
-    - pré-roll
-    - détection de parole après quelques trames
-    - arrêt plus rapide après la fin de phrase
-    """
 
-    vad = webrtcvad.Vad(sensibilite)
-
-    trames_audio = []
-    historique = []
-
-    trames_silence = 0
-    trames_parole_consecutives = 0
-
-    a_parle = False
-
-    max_trames_silence = max(
-        1,
-        int(silence_max_ms / DUREE_TRAME_MS)
-    )
-
-    pre_roll_frames = max(
-        1,
-        int(PRE_ROLL_MS / DUREE_TRAME_MS)
-    )
-
-    # --------------------------------------------------------
-    # Calibration courte
-    # --------------------------------------------------------
-
-    calibration_ms = 300
-
-    calibration_frames = max(
-        1,
-        int(calibration_ms / DUREE_TRAME_MS)
-    )
-
-    # Les toutes premières trames d'un flux audio contiennent souvent
-    # un "clic" de démarrage (pic artificiel à ~1.0) qui n'a rien à
-    # voir avec le bruit ambiant réel. On les exclut de la calibration
-    # pour éviter qu'elles ne fassent exploser le seuil de détection.
-    FRAMES_IGNOREES_DEMARRAGE = 3
-
-    niveaux_bruit = []
-
-    # --------------------------------------------------------
-    # Microphone
-    # --------------------------------------------------------
-
-    stream = sd.InputStream(
-        samplerate=FREQUENCE,
-        channels=1,
-        dtype="int16",
-        blocksize=TAILLE_TRAME
-    )
-
-    try:
-
-        with stream:
-
-            max_trames = int(
-                duree_max_s * 1000 / DUREE_TRAME_MS
-            )
-
-            for index in range(max_trames):
-
-                trame, _ = stream.read(
-                    TAILLE_TRAME
-                )
-
-                trame = trame.copy()
-
-                niveau = calculer_volume(trame)
-
-                if on_level:
-                    on_level(niveau)
-
-                # ------------------------------------------------
-                # Historique pour récupérer le début de la voix
-                # ------------------------------------------------
-
-                historique.append(trame)
-
-                if len(historique) > pre_roll_frames:
-                    historique.pop(0)
-
-                # ------------------------------------------------
-                # Calibration
-                # ------------------------------------------------
-
-                if index < FRAMES_IGNOREES_DEMARRAGE:
-
-                    # Trame de démarrage : ni calibrée, ni testée.
-                    continue
-
-                if index < FRAMES_IGNOREES_DEMARRAGE + calibration_frames:
-
-                    niveaux_bruit.append(niveau)
-
-                    continue
-
-                if niveaux_bruit:
-
-                    # Médiane plutôt que moyenne : une trame aberrante
-                    # isolée ne peut plus, à elle seule, faire grimper
-                    # le seuil de détection.
-                    bruit_moyen = float(
-                        np.median(niveaux_bruit)
-                    )
-
-                else:
-
-                    bruit_moyen = 0.01
-
-                # ------------------------------------------------
-                # Seuil adaptatif
-                # ------------------------------------------------
-
-                seuil_volume = min(
-                    0.3,
-                    max(
-                        0.02,
-                        bruit_moyen * 2.0
-                    )
-                )
-
-                # ------------------------------------------------
-                # VAD
-                # ------------------------------------------------
-
-                try:
-
-                    est_parole_vad = vad.is_speech(
-                        trame.tobytes(),
-                        FREQUENCE
-                    )
-
-                except Exception:
-
-                    est_parole_vad = False
-
-                est_parole = (
-                    est_parole_vad
-                    and niveau >= seuil_volume
-                )
-
-                # ------------------------------------------------
-                # Détection du début
-                # ------------------------------------------------
-
-                if est_parole:
-
-                    trames_parole_consecutives += 1
-
-                else:
-
-                    trames_parole_consecutives = 0
-
-                if not a_parle:
-
-                    # 3 trames = 90 ms
-                    # évite les petits bruits
-                    if trames_parole_consecutives >= 3:
-
-                        trames_audio.extend(
-                            historique
-                        )
-
-                        historique.clear()
-
-                        a_parle = True
-                        trames_silence = 0
-
-                        trames_audio.append(
-                            trame
-                        )
-
-                    continue
-
-                # ------------------------------------------------
-                # Après le début de parole
-                # ------------------------------------------------
-
-                if est_parole:
-
-                    trames_silence = 0
-
-                    trames_audio.append(
-                        trame
-                    )
-
-                else:
-
-                    trames_silence += 1
-
-                    trames_audio.append(
-                        trame
-                    )
-
-                    # Silence suffisamment long
-                    if trames_silence >= max_trames_silence:
+def _initialiser_pyttsx3():
+    """Initialise moteur pyttsx3 (réutilisé, +50% perf)."""
+    global _tts_engine_pyttsx3
+    
+    if _tts_engine_pyttsx3 is None and _pyttsx3_disponible:
+        try:
+            _tts_engine_pyttsx3 = pyttsx3.init()
+            _tts_engine_pyttsx3.setProperty('rate', TTS_RATE)
+            _tts_engine_pyttsx3.setProperty('volume', TTS_VOLUME)
+            
+            # Voix spécifique si définie
+            if TTS_VOICE_ID:
+                _tts_engine_pyttsx3.setProperty('voice', TTS_VOICE_ID)
+            else:
+                # Sélectionner voix française par défaut
+                voices = _tts_engine_pyttsx3.getProperty('voices')
+                for voice in voices:
+                    if 'french' in voice.name.lower() or 'fr' in voice.id.lower():
+                        _tts_engine_pyttsx3.setProperty('voice', voice.id)
                         break
+            
+            log_event("voix", "Moteur pyttsx3 initialisé")
+        except Exception as e:
+            log_error("voix", f"Échec initialisation pyttsx3: {e}")
+            _tts_engine_pyttsx3 = None
+    
+    return _tts_engine_pyttsx3
 
-    except KeyboardInterrupt:
 
-        pass
-
-    except Exception as e:
-
-        print(
-            f"❌ Erreur microphone : {e}"
-        )
-
-    finally:
-
+def _worker_tts_async():
+    """Thread worker pour synthèse vocale asynchrone (non-bloquante)."""
+    global _tts_thread_active
+    
+    while _tts_thread_active:
         try:
-            stream.stop()
-        except Exception:
-            pass
-
-        try:
-            stream.close()
-        except Exception:
-            pass
-
-    # ========================================================
-    # Aucune parole
-    # ========================================================
-
-    if not trames_audio or not a_parle:
-        return None
-
-    audio = np.concatenate(
-        trames_audio,
-        axis=0
-    )
-
-    # ========================================================
-    # Vérification signal
-    # ========================================================
-
-    audio_float = audio.astype(
-        np.float32
-    )
-
-    peak = (
-        float(np.max(np.abs(audio_float)))
-        if audio_float.size
-        else 0.0
-    )
-
-    if peak < 500:
-
-        return None
-
-    # ========================================================
-    # Petite amplification
-    # ========================================================
-
-    if peak < 12000:
-
-        facteur = min(
-            16000.0 / peak,
-            1.8
-        )
-
-        audio = np.clip(
-            audio_float * facteur,
-            -32768,
-            32767
-        ).astype(np.int16)
-
-    return audio
+            texte, callback = _tts_queue.get(timeout=1.0)
+            
+            if texte is None:  # Signal arrêt
+                break
+            
+            # Synthèse bloquante dans thread séparé
+            succes = _parler_sync(texte)
+            
+            if callback:
+                callback(succes)
+            
+            _tts_queue.task_done()
+            
+        except queue.Empty:
+            continue
+        except Exception as e:
+            log_error("voix", f"Erreur worker TTS: {e}")
 
 
-# ============================================================
-# TRANSCRIPTION PARAKEET
-# ============================================================
+def _demarrer_thread_tts():
+    """Démarre thread worker TTS si pas déjà actif."""
+    global _tts_thread, _tts_thread_active
+    
+    if _tts_thread is None or not _tts_thread.is_alive():
+        _tts_thread_active = True
+        _tts_thread = threading.Thread(target=_worker_tts_async, daemon=True)
+        _tts_thread.start()
+        log_event("voix", "Thread TTS asynchrone démarré")
 
-def transcrire_audio(audio_np):
-    """
-    Transcrit l'audio avec Parakeet.
 
-    Optimisation principale :
-    num_beams=1 au lieu de 5.
-
-    Cela réduit fortement le temps de génération
-    tout en conservant un résultat adapté à un assistant vocal.
-    """
-
-    if audio_np is None:
-
-        return ("", "fr")
-
-    audio_np = np.asarray(
-        audio_np
-    ).reshape(-1)
-
-    if audio_np.size == 0:
-
-        return ("", "fr")
-
-    duree = (
-        audio_np.size / FREQUENCE
-    )
-
-    if duree < 0.20:
-
-        print(
-            f"⚠️ Audio trop court : {duree:.2f}s"
-        )
-
-        return ("", "fr")
-
-    print(
-        f"🎤 Audio reçu : {duree:.2f}s"
-    )
-
-    # --------------------------------------------------------
-    # int16 -> float32
-    # --------------------------------------------------------
-
-    audio_float = (
-        audio_np.astype(np.float32)
-        / 32768.0
-    )
-
-    # Retire le DC offset
-    audio_float -= np.mean(
-        audio_float
-    )
-
-    # Protection NaN / Inf
-    audio_float = np.nan_to_num(
-        audio_float,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0
-    )
-
-    modele = get_modele_parakeet()
-
+def _parler_pyttsx3(texte: str) -> bool:
+    """Synthèse vocale avec pyttsx3 (offline, rapide)."""
+    engine = _initialiser_pyttsx3()
+    
+    if engine is None:
+        return False
+    
     try:
-
-        resultat = modele(
-            {
-                "raw": audio_float,
-                "sampling_rate": FREQUENCE
-            },
-
-            generate_kwargs={
-
-                # ------------------------------------------------
-                # IMPORTANT :
-                # 1 beam = beaucoup plus rapide
-                # ------------------------------------------------
-                "num_beams": 1,
-
-                "do_sample": False,
-
-                "temperature": 0.0,
-
-                # Suffisant pour les phrases vocales
-                "max_new_tokens": 128
-            }
-        )
-
-        texte = str(
-            resultat.get(
-                "text",
-                ""
-            )
-        ).strip()
-
-        # Nettoyage des espaces multiples
-        texte = re.sub(
-            r"\s+",
-            " ",
-            texte
-        ).strip()
-
-        print(
-            f"🧠 Parakeet : {texte!r}"
-        )
-
-        return (
-            texte,
-            "fr"
-        )
-
+        engine.say(texte)
+        engine.runAndWait()
+        return True
     except Exception as e:
-
-        print(
-            "❌ Erreur Parakeet : "
-            f"{type(e).__name__}: {e}"
-        )
-
-        log_error(
-            "stt",
-            f"Parakeet échoué : "
-            f"{type(e).__name__}: {str(e)[:100]}",
-            exc_info=False
-        )
-
-        return (
-            "",
-            "fr"
-        )
-
-
-# ============================================================
-# KOKORO
-# ============================================================
-
-_pipelines_kokoro = {}
-
-
-def _obtenir_pipeline_kokoro(
-    lang_code
-):
-    """
-    Charge Kokoro une seule fois par langue.
-    """
-
-    if lang_code not in _pipelines_kokoro:
-
-        print(
-            f"🔊 Chargement de Kokoro ({lang_code})..."
-        )
-
-        from kokoro import KPipeline
-
-        _pipelines_kokoro[
-            lang_code
-        ] = KPipeline(
-            lang_code=lang_code
-        )
-
-        print(
-            f"✅ Kokoro {lang_code} prêt."
-        )
-
-    return _pipelines_kokoro[
-        lang_code
-    ]
-
-
-def _choisir_voix_kokoro(
-    langue
-):
-
-    if langue == "fr":
-
-        return (
-            "f",
-            "ff_siwis"
-        )
-
-    if langue == "en":
-
-        return (
-            "a",
-            "af_heart"
-        )
-
-    return (
-        "f",
-        "ff_siwis"
-    )
-
-
-def _generer_kokoro(
-    texte,
-    langue
-):
-
-    import soundfile as sf
-
-    lang_code, voix = (
-        _choisir_voix_kokoro(
-            langue
-        )
-    )
-
-    pipeline = (
-        _obtenir_pipeline_kokoro(
-            lang_code
-        )
-    )
-
-    morceaux = []
-
-    for _, _, audio in pipeline(
-        texte,
-        voice=voix,
-        speed=1.0
-    ):
-
-        if audio is not None:
-
-            morceaux.append(
-                np.asarray(audio)
-            )
-
-    if not morceaux:
-
-        raise RuntimeError(
-            "Kokoro n'a produit aucun audio."
-        )
-
-    audio_complet = np.concatenate(
-        morceaux
-    )
-
-    # --------------------------------------------------------
-    # Normalisation
-    # --------------------------------------------------------
-
-    audio_complet = (
-        audio_complet
-        .astype(np.float32)
-    )
-
-    peak = float(
-        np.abs(
-            audio_complet
-        ).max()
-    )
-
-    if peak > 0:
-
-        audio_complet = (
-            audio_complet
-            / peak
-            * 0.95
-        )
-
-    # --------------------------------------------------------
-    # Fichier
-    # --------------------------------------------------------
-
-    fichier_sortie = os.path.join(
-        _TEMP_AUDIO_DIR,
-        f"reponse_{uuid.uuid4().hex[:8]}.wav"
-    )
-
-    sf.write(
-        fichier_sortie,
-        audio_complet,
-        24000,
-        subtype="PCM_16"
-    )
-
-    return fichier_sortie
-
-
-# ============================================================
-# DÉCOUPAGE PHRASES
-# ============================================================
-
-def decouper_en_phrases(
-    texte
-):
-    """
-    Découpe le texte en phrases.
-
-    Utilisé notamment par d'anciens composants de JIBI.
-    Le nouveau GUI peut maintenant envoyer les phrases
-    directement pendant le streaming.
-    """
-
-    texte = (
-        texte or ""
-    ).strip()
-
-    if not texte:
-
-        return []
-
-    morceaux = re.split(
-        r"(?<=[.!?。！？])\s+",
-        texte
-    )
-
-    return [
-        morceau.strip()
-        for morceau in morceaux
-        if morceau.strip()
-    ]
-
-
-# ============================================================
-# NETTOYAGE DU TEXTE AVANT SYNTHÈSE VOCALE
-# ============================================================
-
-# Blocs de code ```...``` (y compris ```json ... ```, ```python ... ```)
-_REGEX_BLOC_CODE = re.compile(r"```.*?```", re.DOTALL)
-
-# Code inline `...`
-_REGEX_CODE_INLINE = re.compile(r"`([^`]+)`")
-
-# Objet/liste JSON isolé sur sa propre portion de texte
-# (ex: réponse d'outil collée telle quelle : {"cle": "valeur"})
-_REGEX_JSON_BRUT = re.compile(r"[{\[][\s\S]*[}\]]")
-
-
-def nettoyer_texte_pour_voix(texte):
-    """
-    Retire tout ce qui ne doit jamais être lu à voix haute :
-    blocs de code, code inline, JSON brut.
-
-    Toujours appelée juste avant la synthèse (Kokoro ou serveur TTS),
-    quel que soit l'appelant (gui.py, agent.py, etc.) — le filtrage
-    ne dépend donc pas de la discipline du code appelant.
-    """
-
-    if not texte:
-        return texte
-
-    texte = _REGEX_BLOC_CODE.sub(
-        " J'ai mis le code à l'écran. ", texte
-    )
-
-    texte = _REGEX_CODE_INLINE.sub(r"\1", texte)
-
-    # Si après retrait des blocs de code il ne reste presque
-    # qu'un objet/liste JSON brut, on ne le lit pas tel quel.
-    texte_sans_espaces = texte.strip()
-
-    if texte_sans_espaces and texte_sans_espaces[0] in "{[":
-
-        correspondance = _REGEX_JSON_BRUT.match(texte_sans_espaces)
-
-        if correspondance and len(correspondance.group(0)) > len(texte_sans_espaces) * 0.6:
-
-            return "Voici le résultat, regarde à l'écran."
-
-    texte = re.sub(r"\n{2,}", ". ", texte)
-    texte = re.sub(r"[ \t]{2,}", " ", texte)
-
-    return texte.strip()
-
-
-# ============================================================
-# GÉNÉRATION AUDIO LOCALE
-# ============================================================
-
-def generer_audio(
-    texte,
-    langue="fr"
-):
-    """
-    Génère un fichier audio avec Kokoro.
-
-    Ne joue pas automatiquement le fichier.
-    """
-
-    texte = nettoyer_texte_pour_voix(texte)
-
-    if not texte:
-
-        return None
-
+        log_error("voix", f"Erreur pyttsx3: {e}")
+        return False
+
+
+def _parler_gtts(texte: str) -> bool:
+    """Synthèse vocale avec gTTS (Google TTS, online, meilleure qualité)."""
+    if not _gtts_disponible:
+        return False
+    
     try:
-
-        log_event(
-            "tts",
-            "Kokoro..."
-        )
-
-        return _generer_kokoro(
-            texte,
-            langue
-        )
-
-    except Exception as erreur_kokoro:
-
-        print(
-            "❌ Synthèse vocale KO "
-            f"(Kokoro): {str(erreur_kokoro)[:100]}"
-        )
-
-        log_error(
-            "tts",
-            "Kokoro échoué: "
-            f"{type(erreur_kokoro).__name__}: "
-            f"{str(erreur_kokoro)[:100]}",
-            exc_info=False
-        )
-
-        return None
-
-
-# ============================================================
-# PARLER
-# ============================================================
-
-def parler(
-    texte,
-    langue="fr"
-):
-    """
-    Compatibilité avec l'ancien système.
-    Génère puis ouvre le fichier avec Windows.
-    """
-
-    fichier_sortie = generer_audio(
-        texte,
-        langue
-    )
-
-    if fichier_sortie:
-
-        os.system(
-            f'start "" "{fichier_sortie}"'
-        )
+        # Vérifier cache
+        fichier_cache = _obtenir_fichier_cache(texte)
+        
+        if fichier_cache is None:
+            # Générer nouveau fichier
+            hash_texte = _obtenir_hash_texte(texte)
+            fichier_cache = CACHE_AUDIO_DIR / f"{hash_texte}.mp3"
+            
+            tts = gTTS(text=texte, lang=TTS_LANGUAGE.split('-')[0], slow=False)
+            tts.save(str(fichier_cache))
+            
+            _sauvegarder_cache(texte, fichier_cache)
+            log_event("voix", f"Audio gTTS généré: {fichier_cache.name}")
+        
+        # Lecture audio
+        pygame.mixer.init()
+        pygame.mixer.music.load(str(fichier_cache))
+        pygame.mixer.music.play()
+        
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.1)
+        
+        pygame.mixer.quit()
+        return True
+        
+    except Exception as e:
+        log_error("voix", f"Erreur gTTS: {e}")
+        return False
 
 
-# ============================================================
-# SERVEUR TTS LOCAL
-# ============================================================
-
-URL_SERVEUR_MODELES = (
-    "http://127.0.0.1:8765"
-)
-
-
-def generer_audio_client(
-    texte,
-    langue="fr"
-):
-    """
-    Client TTS utilisé par gui.py.
-
-    Priorité :
-        1. serveur TTS local
-        2. Kokoro directement dans ce processus
-
-    Le format d'appel reste compatible avec
-    l'ancien gui.py et le nouveau.
-    """
-
-    if not texte:
-
-        return None
-
-    texte = nettoyer_texte_pour_voix(
-        str(texte).strip()
-    )
-
-    if not texte:
-
-        return None
-
+async def _parler_edge_tts_async(texte: str) -> bool:
+    """Synthèse vocale avec edge-tts (Microsoft Edge, online, excellente qualité)."""
+    if not _edge_tts_disponible:
+        return False
+    
     try:
+        # Vérifier cache
+        fichier_cache = _obtenir_fichier_cache(texte)
+        
+        if fichier_cache is None:
+            # Générer nouveau fichier
+            hash_texte = _obtenir_hash_texte(texte)
+            fichier_cache = CACHE_AUDIO_DIR / f"{hash_texte}.mp3"
+            
+            # Voix française par défaut : fr-FR-DeniseNeural (femme) ou fr-FR-HenriNeural (homme)
+            voice = TTS_VOICE_ID if TTS_VOICE_ID else "fr-FR-DeniseNeural"
+            
+            communicate = edge_tts.Communicate(texte, voice)
+            await communicate.save(str(fichier_cache))
+            
+            _sauvegarder_cache(texte, fichier_cache)
+            log_event("voix", f"Audio edge-tts généré: {fichier_cache.name}")
+        
+        # Lecture audio
+        pygame.mixer.init()
+        pygame.mixer.music.load(str(fichier_cache))
+        pygame.mixer.music.play()
+        
+        while pygame.mixer.music.get_busy():
+            await asyncio.sleep(0.1)
+        
+        pygame.mixer.quit()
+        return True
+        
+    except Exception as e:
+        log_error("voix", f"Erreur edge-tts: {e}")
+        return False
 
-        import requests
 
-        reponse = requests.post(
-            f"{URL_SERVEUR_MODELES}/synthetiser",
+def _parler_edge_tts(texte: str) -> bool:
+    """Wrapper synchrone pour edge-tts."""
+    if not _edge_tts_disponible:
+        return False
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        resultat = loop.run_until_complete(_parler_edge_tts_async(texte))
+        loop.close()
+        return resultat
+    except Exception as e:
+        log_error("voix", f"Erreur edge-tts wrapper: {e}")
+        return False
 
-            data={
-                "texte": texte,
-                "langue": langue
-            },
 
-            # Timeout raisonnable
-            timeout=30
-        )
-
-        reponse.raise_for_status()
-
-        content_type = (
-            reponse.headers
-            .get(
-                "content-type",
-                ""
-            )
-            .lower()
-        )
-
-        if "wav" in content_type:
-
-            extension = ".wav"
-
-        elif "mp3" in content_type:
-
-            extension = ".mp3"
-
+def _parler_sync(texte: str) -> bool:
+    """
+    Synthèse vocale synchrone (bloquante).
+    
+    Performance :
+    - Cache hit : ~100-300ms (lecture MP3)
+    - Cache miss pyttsx3 : ~500ms-2s
+    - Cache miss gTTS : ~1-3s (réseau)
+    - Cache miss edge-tts : ~1-3s (réseau)
+    """
+    if not TTS_ACTIVE or not texte.strip():
+        return False
+    
+    _stats_voix["tts_total"] += 1
+    
+    # Nettoyer texte (retirer markdown, emojis excessifs)
+    texte_clean = texte.replace("**", "").replace("*", "").replace("#", "")
+    texte_clean = ' '.join(texte_clean.split())  # Normaliser espaces
+    
+    # Limiter longueur (éviter synthèse trop longue)
+    if len(texte_clean) > 500:
+        texte_clean = texte_clean[:500] + "..."
+    
+    try:
+        if TTS_ENGINE == "pyttsx3":
+            return _parler_pyttsx3(texte_clean)
+        elif TTS_ENGINE == "gTTS":
+            return _parler_gtts(texte_clean)
+        elif TTS_ENGINE == "edge-tts":
+            return _parler_edge_tts(texte_clean)
         else:
-
-            # Ton serveur actuel renvoie
-            # probablement du WAV.
-            extension = ".wav"
-
-        fichier_sortie = os.path.join(
-            _TEMP_AUDIO_DIR,
-            f"reponse_{uuid.uuid4().hex[:8]}"
-            f"{extension}"
-        )
-
-        # ----------------------------------------------------
-        # Écriture directe
-        # ----------------------------------------------------
-
-        with open(
-            fichier_sortie,
-            "wb"
-        ) as f:
-
-            f.write(
-                reponse.content
-            )
-
-        taille = os.path.getsize(
-            fichier_sortie
-        )
-
-        if taille <= 0:
-
-            raise RuntimeError(
-                "Le serveur TTS a renvoyé "
-                "un fichier vide."
-            )
-
-        log_event(
-            "tts",
-            f"Audio prêt : "
-            f"{os.path.basename(fichier_sortie)} "
-            f"({taille} bytes)"
-        )
-
-        return fichier_sortie
-
+            log_warning("voix", f"Moteur TTS inconnu: {TTS_ENGINE}")
+            return False
     except Exception as e:
+        log_error("voix", f"Erreur synthèse vocale: {e}")
+        return False
 
-        log_error(
-            "tts",
-            f"Erreur serveur audio : "
-            f"{type(e).__name__}: {str(e)[:120]}",
-            exc_info=False
+
+def parler(texte: str, async_mode: Optional[bool] = None, callback: Optional[Callable] = None) -> bool:
+    """
+    Synthèse vocale (TTS) avec mode synchrone ou asynchrone.
+    
+    Args:
+        texte: Texte à synthétiser
+        async_mode: Mode asynchrone (défaut: TTS_ASYNC)
+        callback: Fonction appelée après synthèse (async seulement)
+    
+    Returns:
+        True si synthèse lancée avec succès
+    
+    Exemples:
+        parler("Bonjour")  # Bloquant si TTS_ASYNC=0
+        parler("Bonjour", async_mode=True, callback=lambda ok: print("Fini!"))
+    """
+    if not TTS_ACTIVE:
+        return False
+    
+    mode_async = async_mode if async_mode is not None else TTS_ASYNC
+    
+    if mode_async:
+        # Mode asynchrone (non-bloquant, recommandé)
+        _demarrer_thread_tts()
+        _tts_queue.put((texte, callback))
+        return True
+    else:
+        # Mode synchrone (bloquant)
+        return _parler_sync(texte)
+
+
+def arreter_parole():
+    """Arrête synthèse vocale en cours."""
+    global _tts_thread_active
+    
+    try:
+        # Vider queue
+        while not _tts_queue.empty():
+            try:
+                _tts_queue.get_nowait()
+                _tts_queue.task_done()
+            except queue.Empty:
+                break
+        
+        # Arrêter pyttsx3
+        if _tts_engine_pyttsx3:
+            try:
+                _tts_engine_pyttsx3.stop()
+            except:
+                pass
+        
+        # Arrêter pygame
+        try:
+            import pygame
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+                pygame.mixer.quit()
+        except:
+            pass
+        
+        log_event("voix", "Synthèse vocale arrêtée")
+        return True
+        
+    except Exception as e:
+        log_error("voix", f"Erreur arrêt parole: {e}")
+        return False
+
+
+# ============================================================
+# STT (SPEECH-TO-TEXT) - Reconnaissance vocale
+# ============================================================
+
+_recognizer = None
+
+
+def _initialiser_recognizer():
+    """Initialise recognizer (réutilisé)."""
+    global _recognizer
+    
+    if _recognizer is None and _speech_recognition_disponible:
+        _recognizer = sr.Recognizer()
+        # Ajuster pour bruit ambiant
+        _recognizer.energy_threshold = 4000
+        _recognizer.dynamic_energy_threshold = True
+        log_event("voix", "Recognizer initialisé")
+    
+    return _recognizer
+
+
+def ecouter(timeout: Optional[int] = None, phrase_limit: Optional[int] = None) -> Optional[str]:
+    """
+    Reconnaissance vocale (STT) depuis microphone.
+    
+    Args:
+        timeout: Timeout écoute en secondes (défaut: STT_TIMEOUT)
+        phrase_limit: Durée max phrase en secondes (défaut: STT_PHRASE_LIMIT)
+    
+    Returns:
+        Texte reconnu ou None si échec
+    
+    Performance: ~2-5s (dépend longueur phrase + réseau)
+    
+    Exemple:
+        texte = ecouter()
+        if texte:
+            print(f"Vous avez dit: {texte}")
+    """
+    if not STT_ACTIVE:
+        log_warning("voix", "STT désactivé (STT_ACTIVE=0)")
+        return None
+    
+    if not _speech_recognition_disponible:
+        log_warning("voix", "SpeechRecognition non installé")
+        return None
+    
+    _stats_voix["stt_total"] += 1
+    
+    recognizer = _initialiser_recognizer()
+    if recognizer is None:
+        return None
+    
+    timeout_val = timeout if timeout is not None else STT_TIMEOUT
+    phrase_limit_val = phrase_limit if phrase_limit is not None else STT_PHRASE_LIMIT
+    
+    try:
+        with sr.Microphone() as source:
+            log_event("voix", "🎤 Écoute en cours...")
+            
+            # Ajuster bruit ambiant (1 seconde)
+            recognizer.adjust_for_ambient_noise(source, duration=1)
+            
+            # Capturer audio
+            audio = recognizer.listen(
+                source,
+                timeout=timeout_val,
+                phrase_time_limit=phrase_limit_val
+            )
+            
+            log_event("voix", "🔄 Reconnaissance en cours...")
+            
+            # Reconnaissance selon moteur
+            if STT_ENGINE == "google":
+                texte = recognizer.recognize_google(audio, language=STT_LANGUAGE)
+            elif STT_ENGINE == "sphinx":
+                texte = recognizer.recognize_sphinx(audio, language=STT_LANGUAGE)
+            elif STT_ENGINE == "whisper" and _whisper_disponible:
+                # Whisper nécessite fichier temporaire
+                fichier_temp = CACHE_AUDIO_DIR / f"temp_stt_{int(time.time())}.wav"
+                with open(fichier_temp, "wb") as f:
+                    f.write(audio.get_wav_data())
+                
+                model = whisper.load_model("base")
+                result = model.transcribe(str(fichier_temp), language="fr")
+                texte = result["text"]
+                
+                fichier_temp.unlink()  # Nettoyer
+            else:
+                log_warning("voix", f"Moteur STT inconnu: {STT_ENGINE}")
+                return None
+            
+            _stats_voix["stt_success"] += 1
+            log_event("voix", f"✅ Reconnu: {texte}")
+            return texte
+            
+    except sr.WaitTimeoutError:
+        log_warning("voix", "Timeout écoute (aucun son détecté)")
+        _stats_voix["stt_echecs"] += 1
+        return None
+    except sr.UnknownValueError:
+        log_warning("voix", "Parole non comprise")
+        _stats_voix["stt_echecs"] += 1
+        return None
+    except sr.RequestError as e:
+        log_error("voix", f"Erreur API reconnaissance: {e}")
+        _stats_voix["stt_echecs"] += 1
+        return None
+    except Exception as e:
+        log_error("voix", f"Erreur reconnaissance vocale: {e}")
+        _stats_voix["stt_echecs"] += 1
+        return None
+
+
+def ecouter_en_boucle(callback: Callable[[str], None], stop_event: threading.Event):
+    """
+    Écoute continue en arrière-plan jusqu'à stop_event.
+    
+    Args:
+        callback: Fonction appelée avec texte reconnu
+        stop_event: Event pour arrêter écoute
+    
+    Exemple:
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=ecouter_en_boucle,
+            args=(lambda texte: print(f"Reçu: {texte}"), stop),
+            daemon=True
         )
+        thread.start()
+        
+        # ... plus tard ...
+        stop.set()  # Arrêter écoute
+    """
+    log_event("voix", "Écoute continue démarrée")
+    
+    while not stop_event.is_set():
+        try:
+            texte = ecouter(timeout=2, phrase_limit=10)
+            if texte:
+                callback(texte)
+        except Exception as e:
+            log_error("voix", f"Erreur boucle écoute: {e}")
+            time.sleep(1)
+    
+    log_event("voix", "Écoute continue arrêtée")
 
-        print(
-            "⚠️ Serveur TTS indisponible, "
-            "utilisation de Kokoro local."
-        )
 
-        # ----------------------------------------------------
-        # FALLBACK KOKORO
-        # ----------------------------------------------------
+# ============================================================
+# UTILITAIRES
+# ============================================================
 
-        return generer_audio(
-            texte,
-            langue
-        )
+def lister_voix_disponibles() -> list:
+    """
+    Liste toutes les voix TTS disponibles sur le système.
+    
+    Returns:
+        [{"id": "...", "nom": "...", "langues": [...]}, ...]
+    """
+    voix = []
+    
+    if _pyttsx3_disponible:
+        try:
+            engine = _initialiser_pyttsx3()
+            if engine:
+                for voice in engine.getProperty('voices'):
+                    voix.append({
+                        "id": voice.id,
+                        "nom": voice.name,
+                        "langues": voice.languages if hasattr(voice, 'languages') else []
+                    })
+        except Exception as e:
+            log_warning("voix", f"Erreur liste voix pyttsx3: {e}")
+    
+    return voix
+
+
+def obtenir_statistiques_voix():
+    """
+    Statistiques usage voix (monitoring).
+    
+    Returns:
+        {
+            "tts_total": 42,
+            "tts_cache_hits": 30,
+            "tts_cache_misses": 12,
+            "tts_cache_hit_rate": 71.43,
+            "stt_total": 15,
+            "stt_success": 12,
+            "stt_echecs": 3,
+            "stt_success_rate": 80.0,
+            "cache_files_count": 45
+        }
+    """
+    stats = _stats_voix.copy()
+    
+    # Taux cache TTS
+    total_tts_cache = stats["tts_cache_hits"] + stats["tts_cache_misses"]
+    if total_tts_cache > 0:
+        stats["tts_cache_hit_rate"] = round(stats["tts_cache_hits"] / total_tts_cache * 100, 2)
+    else:
+        stats["tts_cache_hit_rate"] = 0.0
+    
+    # Taux succès STT
+    if stats["stt_total"] > 0:
+        stats["stt_success_rate"] = round(stats["stt_success"] / stats["stt_total"] * 100, 2)
+    else:
+        stats["stt_success_rate"] = 0.0
+    
+    # Fichiers cache
+    stats["cache_files_count"] = len(list(CACHE_AUDIO_DIR.glob("*.mp3")))
+    
+    return stats
+
+
+def reinitialiser_cache_audio():
+    """Vide cache audio (supprime tous fichiers MP3)."""
+    try:
+        count = 0
+        for fichier in CACHE_AUDIO_DIR.glob("*.mp3"):
+            fichier.unlink()
+            count += 1
+        
+        _cache_audio.clear()
+        log_event("voix", f"{count} fichiers cache audio supprimés")
+        return f"{count} fichiers supprimés."
+    except Exception as e:
+        log_error("voix", f"Erreur réinitialisation cache: {e}")
+        return "Erreur lors du nettoyage."
+
+
+def tester_voix():
+    """
+    Test complet du système vocal (TTS + STT).
+    
+    Retourne rapport détaillé.
+    """
+    rapport = {
+        "tts_disponible": False,
+        "tts_moteur": TTS_ENGINE,
+        "tts_test": False,
+        "stt_disponible": False,
+        "stt_moteur": STT_ENGINE,
+        "voix_count": 0,
+        "cache_actif": TTS_CACHE_ACTIVE,
+        "erreurs": []
+    }
+    
+    # Test TTS
+    print("🔊 Test synthèse vocale (TTS)...")
+    try:
+        if TTS_ENGINE == "pyttsx3" and _pyttsx3_disponible:
+            rapport["tts_disponible"] = True
+            rapport["tts_test"] = parler("Test de synthèse vocale.", async_mode=False)
+        elif TTS_ENGINE == "gTTS" and _gtts_disponible:
+            rapport["tts_disponible"] = True
+            rapport["tts_test"] = parler("Test de synthèse vocale.", async_mode=False)
+        elif TTS_ENGINE == "edge-tts" and _edge_tts_disponible:
+            rapport["tts_disponible"] = True
+            rapport["tts_test"] = parler("Test de synthèse vocale.", async_mode=False)
+        else:
+            rapport["erreurs"].append(f"Moteur TTS '{TTS_ENGINE}' non disponible")
+    except Exception as e:
+        rapport["erreurs"].append(f"Erreur test TTS: {e}")
+    
+    # Liste voix
+    try:
+        voix = lister_voix_disponibles()
+        rapport["voix_count"] = len(voix)
+    except Exception as e:
+        rapport["erreurs"].append(f"Erreur liste voix: {e}")
+    
+    # Test STT
+    if STT_ACTIVE:
+        print("🎤 Test reconnaissance vocale (STT) - Parlez maintenant...")
+        try:
+            if _speech_recognition_disponible:
+                rapport["stt_disponible"] = True
+                texte = ecouter(timeout=5)
+                if texte:
+                    print(f"✅ Reconnu: {texte}")
+                else:
+                    print("❌ Aucune parole reconnue")
+            else:
+                rapport["erreurs"].append("SpeechRecognition non installé")
+        except Exception as e:
+            rapport["erreurs"].append(f"Erreur test STT: {e}")
+    
+    # Statistiques
+    stats = obtenir_statistiques_voix()
+    rapport["stats"] = stats
+    
+    return rapport
+
+
+def nettoyer_ressources_voix():
+    """Libère toutes ressources voix (à appeler avant fermeture app)."""
+    global _tts_thread_active, _tts_engine_pyttsx3
+    
+    try:
+        # Arrêter thread TTS
+        _tts_thread_active = False
+        if _tts_thread and _tts_thread.is_alive():
+            _tts_queue.put((None, None))  # Signal arrêt
+            _tts_thread.join(timeout=2)
+        
+        # Fermer moteur pyttsx3
+        if _tts_engine_pyttsx3:
+            try:
+                _tts_engine_pyttsx3.stop()
+            except:
+                pass
+            _tts_engine_pyttsx3 = None
+        
+        # Fermer pygame
+        try:
+            import pygame
+            if pygame.mixer.get_init():
+                pygame.mixer.quit()
+        except:
+            pass
+        
+        log_event("voix", "Ressources voix libérées")
+        return True
+        
+    except Exception as e:
+        log_error("voix", f"Erreur nettoyage ressources: {e}")
+        return False
+
+
+# ============================================================
+# INITIALISATION AUTO
+# ============================================================
+
+if __name__ == "__main__":
+    print("🎤 Test système vocal JIBI...\n")
+    
+    rapport = tester_voix()
+    
+    print("\n" + "="*60)
+    print("📊 RAPPORT TEST VOCAL")
+    print("="*60)
+    print(f"TTS disponible : {'✅' if rapport['tts_disponible'] else '❌'}")
+    print(f"TTS moteur : {rapport['tts_moteur']}")
+    print(f"TTS test : {'✅' if rapport['tts_test'] else '❌'}")
+    print(f"STT disponible : {'✅' if rapport['stt_disponible'] else '❌'}")
+    print(f"STT moteur : {rapport['stt_moteur']}")
+    print(f"Voix disponibles : {rapport['voix_count']}")
+    print(f"Cache actif : {'✅' if rapport['cache_actif'] else '❌'}")
+    
+    if rapport.get('stats'):
+        stats = rapport['stats']
+        print(f"\n📈 Statistiques :")
+        print(f"  - TTS total : {stats['tts_total']}")
+        print(f"  - Cache hit rate : {stats['tts_cache_hit_rate']}%")
+        print(f"  - Fichiers cache : {stats['cache_files_count']}")
+        print(f"  - STT success rate : {stats['stt_success_rate']}%")
+    
+    if rapport['erreurs']:
+        print(f"\n⚠️ Erreurs ({len(rapport['erreurs'])}) :")
+        for erreur in rapport['erreurs']:
+            print(f"  - {erreur}")
+    
+    print("="*60)
