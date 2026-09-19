@@ -1,682 +1,1954 @@
 """
-AGENT CORE v3.5 — FULL (diagnostic corrigé + evolution.proposer + router fichier)
+AGENT CORE JIBI — v8
+
+Rôle :
+    Interface principale entre :
+        - utilisateur
+        - routeur
+        - cerveau / LLM
+        - outils
+        - orchestrateur d'auto-amélioration
+
+Principe :
+    AgentCore route et coordonne.
+    Cerveau communique avec le LLM.
+    Orchestrateur contrôle les modifications.
+    Sécurité contrôle les accès préliminaires.
+
+CORRECTIONS v8 :
+    - Routage amélioré pour différencier :
+        * Questions conversationnelles → cerveau
+        * Demandes d'analyse/explication → cerveau
+        * Analyse de code → analyseur_code
+        * Diagnostic technique système → orchestrateur
+        * Modifications de code → propositions
+    - Classification locale réduite aux cas évidents
+    - Le LLM traite les cas ambigus
+
+AgentCore ne :
+    - écrit jamais directement un fichier de production ;
+    - ne crée jamais directement un outil en production ;
+    - ne gère pas les backups ;
+    - ne gère pas les rollbacks ;
+    - ne contourne pas les autorisations ;
+    - n'exécute pas un outil avec des arguments non validés.
 """
+
 from __future__ import annotations
-import re
-import json
-import time
-import uuid
-import threading
+
 import inspect
-from dataclasses import dataclass, field
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import json
+import logging
+import re
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, Dict, List, Optional
 
-DEPOT_DIR = Path(__file__).resolve().parent.parent
+from core import cerveau
+from core import router
+from core import securite
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logger = logging.getLogger("jibi.agent_core")
+
+
+# ============================================================
+# IMPORTS OPTIONNELS
+# ============================================================
+
 try:
-    from core.config import JIBI_PROJET_DIR as _CFG_DEPOT
-    DEPOT_DIR = _CFG_DEPOT
+    from self_improvement.orchestrateur import creer_orchestrateur
 except Exception:
-    pass
+    creer_orchestrateur = None
 
-from core import evolution
+
 try:
-    from core import cerveau
+    from self_improvement.gestionnaire import (
+        analyser_jibi,
+        tableau_de_bord,
+    )
 except Exception:
-    cerveau = None
+    analyser_jibi = None
+    tableau_de_bord = None
+
 
 try:
-    from self_improvement.gestionnaire import analyser_jibi, preparer_amelioration, autoriser_et_appliquer
-    from self_improvement.autorisation import rejeter_proposition, lister_propositions_en_attente
-    SI_OK = True
-except ImportError:
-    SI_OK = False
-    def analyser_jibi(**kw): return {"score_sante": 100, "niveau_sante": "?", "patterns_recurrents": [], "nombre_erreurs": 0}
-    def preparer_amelioration(**kw): return {"ok": False, "message": "gestionnaire indisponible"}
-    def autoriser_et_appliquer(**kw): return {"succes": False, "erreur": "gestionnaire indisponible"}
-    def rejeter_proposition(**kw): return {"ok": False, "message": "indisponible"}
-    def lister_propositions_en_attente(): return []
-
-try:
-    import tools
-    from tools.tool_registry import get_tool, list_tools
-    try:
-        from tools.tool_registry import TOOLS_REGISTRY
-    except Exception:
-        TOOLS_REGISTRY = {}
-    TOOLS_OK = True
+    from self_improvement import analyseur_code
 except Exception:
-    TOOLS_OK = False
+    analyseur_code = None
+
+
+try:
+    from tools import TOOLS_REGISTRY
+except Exception:
+    logger.warning(
+        "Registre d'outils (tools/) indisponible : "
+        "AgentCore démarrera sans outils enregistrés."
+    )
     TOOLS_REGISTRY = {}
-    def get_tool(n): return None
-    def list_tools(): return {}
 
-_TOOLS_CACHE: Dict[str, Any] = {"data": None, "t": 0.0}
-_TOOLS_CACHE_TTL = 3.0  # secondes — list_tools() est appelé ~4x/message, inutile de rescanner à chaque fois
 
-def _list_tools_cached() -> dict:
-    now = time.time()
-    if _TOOLS_CACHE["data"] is not None and (now - _TOOLS_CACHE["t"]) < _TOOLS_CACHE_TTL:
-        return _TOOLS_CACHE["data"]
-    try:
-        data = list_tools() or {}
-    except Exception:
-        data = {}
-    _TOOLS_CACHE["data"] = data
-    _TOOLS_CACHE["t"] = now
-    return data
+def _outils_depuis_registre() -> Dict[str, Callable[..., Any]]:
+    """
+    Construit le dict {nom_outil: fonction} attendu par AgentCore
+    à partir de tools.TOOLS_REGISTRY (qui stocke des specs enrichies
+    {"function", "description", "parameters"}, pas des callables nus).
+    """
 
-RE_AUTORISE = re.compile(r"^j(?:['’])?autorise\s+(\S+)", re.I)
-RE_REJET = re.compile(r"^(?:je\s+)?rejet(?:t?e|er)\s+(\S+)", re.I)
-RE_CONFIRME = re.compile(r"^(?:confirme|oui)\s+(\S+)\s*$", re.I)
-RE_FICHIER = re.compile(r"[\w./\\-]+\.py")
-RE_CREATION = re.compile(r"^(?:cr[ée]e|ajoute)\s+(?:un\s+|une\s+)?(?:outil|fonctionnalit[ée]|plugin|fonction)\s+([A-Za-z_]\w*)\s*:\s*(.+)$", re.I | re.S)
-RE_LANCE = re.compile(r"^(?:lance|ex[ée]cute|execute)\s+([a-zA-Z_]\w*)\s*(.*)$", re.I | re.S)
-RE_LIS_URL = re.compile(r"^(?:lis|lire)\s+(https?://\S+)\s*$", re.I)
-RE_OUVRE = re.compile(r"^(?:ouvre|va\s+sur|va\s+à)\s+(.+)$", re.I)
-RE_SALUTATION = re.compile(r"^(bonjour|bonsoir|salut|coucou|hello|hey|yo|[cç]a\s*va\??|comment\s*(vas[- ]tu|ça\s*va|tu\s*vas)\??)\s*[!.?]*$", re.I)
-RE_JSON_ARGS = re.compile(r"(\{.*\})", re.S)
-RE_KV = re.compile(r"""(\w+)\s*=\s*(".*?"|'.*?'|\S+)""")
+    outils: Dict[str, Callable[..., Any]] = {}
 
-MODIFIABLES_DIAG = ["gui.py", "tools/browser.py", "tools/files.py", "tools/pc_control.py", "tools/terminal.py", "tools/vision.py", "tools/documents.py", "tools/web_search.py"]
-SITES_CONNUS = {"google": "https://www.google.com", "youtube": "https://www.youtube.com", "gmail": "https://mail.google.com", "wikipedia": "https://www.wikipedia.org", "github": "https://github.com", "chatgpt": "https://chat.openai.com", "twitter": "https://x.com", "x": "https://x.com", "facebook": "https://www.facebook.com", "instagram": "https://www.instagram.com"}
+    for nom, spec in TOOLS_REGISTRY.items():
 
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
+        fonction = (
+            spec.get("function")
+            if isinstance(spec, dict)
+            else None
+        )
 
-# ==========================================
-# FIX 1 : classification_locale reçoit "améliore"
-# ==========================================
-def classification_locale(msg: str) -> str:
-    low = (msg or "").strip().lower()
-    if not low:
-        return "DISCUSSION"
-    if RE_SALUTATION.match(low):
-        return "SALUTATION"
-    if re.match(r"^(cherche|recherche|trouve)\b", low):
-        return "RECHERCHE"
-    if re.search(r"\.(py|txt|md|json|csv)\b", low) or "fichier" in low:
-        # FIX : ajoute "améliore|ameliore|change|corrige|optimise|design"
-        if re.search(r"^(crée|cree|ouvre|lis|lire|modifie|édite|supprime|renomme|liste|écris|ecris|améliore|ameliore|change|corrige|optimise|design)", low):
-            return "FICHIER"
-    if re.search(r"(code|fonction|classe|python|javascript|bug|corrige|implémente)", low):
-        return "CODE"
-    first = low.split()[0] if low.split() else ""
-    try:
-        tools_list = _list_tools_cached() or {}
-        if first in tools_list:
-            return "OUTIL"
-    except Exception:
-        pass
-    if re.match(r"^(diagnostic|diagnostique|status|statut|état|etat|score|santé|sante)\b", low):
-        return "DIAGNOSTIC"
-    if re.match(r"^(executer|exécuter|commande|shell|terminal)\b", low):
-        return "COMMANDE"
-    if "?" in msg or low.startswith(("que ", "qui ", "ou ", "où ", "comment ", "pourquoi ", "quand ")):
-        return "QUESTION"
-    if len(low.split()) <= 6:
-        return "DISCUSSION"
-    return "TACHE_COMPLEXE"
+        if callable(fonction):
+            outils[nom] = fonction
+        else:
+            logger.warning(
+                "Outil '%s' ignoré : pas de fonction "
+                "appelable dans le registre.",
+                nom,
+            )
+
+    return outils
+
+
+# ============================================================
+# RÉPONSE
+# ============================================================
 
 @dataclass
 class ReponseAgent:
     texte: str
-    confidence: float = 0.8
-    action_requise: Optional[Dict[str, Any]] = None
-    amelioration_proposee: bool = False
-    requiere_autorisation: bool = False
-    proposition_id: Optional[str] = None
+    confidence: float = 1.0
+    intention: str = ""
+    succes: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
-    date_creation: str = field(default_factory=lambda: datetime.now().isoformat())
-    def to_dict(self):
-        return self.__dict__.copy()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# ============================================================
+# OUTILS
+# ============================================================
 
 class AgentCore:
-    def __init__(self, config=None):
-        self._historique: List[Dict] = []
-        self._nombre_actions_total = 0
-        self._nombre_actions_succes = 0
-        self._nombre_erreurs = 0
-        self._nombre_ameliorations_proposees = 0
-        self._nombre_ameliorations_appliquees = 0
-        self._derniere_analyse_sante = {"score": 100, "date": None}
-        self._actions_en_attente: Dict[str, Dict[str, Any]] = {}
-        self._llm_cache = {"ok": False, "t": 0.0}
-        self._lock = threading.Lock()
-        self._last_timings: Dict[str, float] = {}
+
+    def __init__(
+        self,
+        outils: Optional[Dict[str, Callable[..., Any]]] = None,
+    ) -> None:
+
+        self.outils: Dict[str, Callable[..., Any]] = (
+            outils
+            if outils is not None
+            else _outils_depuis_registre()
+        )
+
+        self._orchestrateur = None
+
+        if creer_orchestrateur is not None:
+            try:
+                self._orchestrateur = (
+                    creer_orchestrateur()
+                )
+
+            except Exception as exc:
+                logger.warning(
+                    "Orchestrateur indisponible : %s",
+                    exc,
+                )
+
+    # ========================================================
+    # LLM
+    # ========================================================
 
     def _llm_disponible(self) -> bool:
-        if cerveau is None:
-            return False
-        now = time.time()
-        with self._lock:
-            if now - self._llm_cache["t"] < 5.0:
-                return bool(self._llm_cache["ok"])
         try:
-            ok = bool(cerveau.disponible(force=True))
+            return bool(
+                cerveau.disponible()
+            )
+
         except Exception:
-            ok = False
-        with self._lock:
-            self._llm_cache = {"ok": ok, "t": now}
-        return ok
+            return False
 
-    def _doit_appeler_llm(self, msg: str) -> bool:
-        msg = msg or ""
-        low = msg.lower().strip()
-        if not msg:
-            return False
-        if (RE_AUTORISE.match(msg) or RE_REJET.match(msg) or RE_CONFIRME.match(msg)):
-            return False
-        if low.strip(" .!?") in {"liste", "list", "propositions", "en attente", "status", "statut", "santé", "sante", "état", "etat", "score"}:
-            return False
-        if (RE_LANCE.match(msg) or RE_LIS_URL.match(msg) or RE_OUVRE.match(msg)):
-            return False
-        if RE_SALUTATION.match(low):
-            return False
-        parties = msg.split(None, 1)
-        first = parties[0] if parties else ""
-        if first and first in (_list_tools_cached() or {}):
-            return False
-        if len(msg) < 12:
-            return False
-        return True
+    # ========================================================
+    # TOOL SPEC
+    # ========================================================
 
-    def _est_discussion_simple(self, msg: str) -> bool:
-        low = _norm(msg).lower()
-        if not low:
-            return False
-        mots_action = ("modifie", "modifier", "change", "changer", "corrige", "corriger", "améliore", "ameliore", "optimise", "crée", "cree", "ajoute", "supprime", "efface", "cherche", "recherche", "trouve", "ouvre", "lance", "exécute", "execute", "diagnostique", "diagnostic", "répare", "repare", "installe", "désinstalle", "desinstalle", "lis ", "lire ", "écris", "ecris", "fais un fichier", "crée un fichier", "cree un fichier")
-        if any(k in low for k in mots_action):
-            return False
-        if RE_FICHIER.search(msg):
-            return False
-        parties = msg.split(None, 1)
-        first = parties[0] if parties else ""
-        if first and first in (_list_tools_cached() or {}):
-            return False
-        if len(low) <= 80:
-            return True
-        return False
+    def _annotation_type(
+        self,
+        annotation: Any,
+    ) -> str:
+        """
+        Convertit une annotation Python simple en type JSON.
+        """
 
-    def _parse_args(self, txt: str) -> dict:
-        txt = (txt or "").strip()
-        if not txt:
-            return {}
-        m = RE_JSON_ARGS.search(txt)
-        if m:
-            try:
-                data = json.loads(m.group(1))
-                if isinstance(data, dict):
-                    return data
-            except Exception:
-                pass
-        out = {}
-        for k, v in RE_KV.findall(txt):
-            v = v.strip()
-            if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                v = v[1:-1]
-            elif v.lower() in ("true", "false"):
-                v = v.lower() == "true"
-            else:
-                try:
-                    v = int(v)
-                except Exception:
-                    try:
-                        v = float(v)
-                    except Exception:
-                        pass
-            out[k] = v
-        return out
+        if annotation is inspect.Parameter.empty:
+            return "string"
 
-    def _tool_spec(self, nom: str) -> dict:
+        if annotation is int:
+            return "integer"
+
+        if annotation is float:
+            return "number"
+
+        if annotation is bool:
+            return "boolean"
+
+        if annotation in (dict, Dict):
+            return "object"
+
+        if annotation in (list, List):
+            return "array"
+
+        return "string"
+
+    def _tool_spec(
+        self,
+        nom: str,
+        fonction: Callable[..., Any],
+    ) -> Dict[str, Any]:
+        """
+        Construit une description déclarative d'un outil.
+
+        Cette fonction ne permet aucune exécution.
+        """
+
         try:
-            return (TOOLS_REGISTRY or {}).get(nom) or {}
-        except Exception:
-            return {}
+            signature = inspect.signature(fonction)
 
-    def _valider_schema(self, schema: dict | None, args: dict) -> Tuple[bool, str, dict]:
-        if not schema or schema.get("type") != "object":
-            return True, "schema: (aucun)", args
-        props = schema.get("properties", {}) or {}
-        required = set(schema.get("required", []) or [])
-        missing = [k for k in required if k not in args]
-        if missing:
-            return False, "Paramètres manquants: " + ", ".join(missing), args
-        casted = dict(args)
-        for k, spec in props.items():
-            if k not in casted:
+        except Exception as exc:
+            logger.warning(
+                "Signature outil impossible %s : %s",
+                nom,
+                exc,
+            )
+
+            return {
+                "name": nom,
+                "description": f"Outil JIBI : {nom}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            }
+
+        properties: Dict[str, Any] = {}
+        required: List[str] = []
+
+        for param_name, param in signature.parameters.items():
+
+            if param.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
                 continue
-            t = (spec or {}).get("type")
-            v = casted[k]
-            try:
-                if t == "integer" and not isinstance(v, int):
-                    casted[k] = int(v)
-                elif t == "number" and not isinstance(v, (int, float)):
-                    casted[k] = float(v)
-                elif t == "boolean" and not isinstance(v, bool):
-                    casted[k] = str(v).lower() in ("1", "true", "yes", "oui")
-                elif t == "string" and not isinstance(v, str):
-                    casted[k] = str(v)
-            except Exception:
-                return False, f"Type invalide pour {k} (attendu {t})", args
-        return True, "schema: OK", casted
 
-    def _est_sensible(self, nom: str, args: dict, schema: dict | None) -> bool:
-        if (schema and schema.get("properties") and "confirmer" in schema["properties"]):
-            return not bool((args or {}).get("confirmer"))
-        n = (nom or "").lower()
-        segments = set(n.split("_"))
-        if "rm" in segments:
-            return True
-        racines_specifiques = ("supprim", "delete", "remove", "wipe", "format", "kill", "update", "mise_a_jour", "restaurer")
-        if any(x in n for x in racines_specifiques):
-            return True
-        return False
+            properties[param_name] = {
+                "type": self._annotation_type(
+                    param.annotation
+                )
+            }
 
-    def url_directe_pour_message(self, msg: str) -> Optional[str]:
-        m = RE_OUVRE.match(msg.strip())
-        if not m:
-            return None
-        cible = _norm(m.group(1)).lower()
-        cible = re.sub(r"^(le|la|les|un|une)\s+", "", cible).strip()
-        if cible.startswith(("http://", "https://")):
-            return cible
-        if cible.startswith("www."):
-            return "https://" + cible
-        return SITES_CONNUS.get(cible)
+            if param.default is inspect.Parameter.empty:
+                required.append(param_name)
 
-    def traiter_message(self, message: str, context=None, on_chunk=None, cancel_event=None) -> ReponseAgent:
-        t_router0 = time.perf_counter()
-        msg = _norm(message)
-        low = msg.lower()
-        self._log("reçu", msg)
-        cat = classification_locale(msg)
-        t_router = time.perf_counter() - t_router0
+        description = (
+            getattr(
+                fonction,
+                "__doc__",
+                None,
+            )
+            or f"Outil JIBI : {nom}"
+        )
+
+        return {
+            "name": nom,
+            "description": str(description).strip(),
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        }
+
+    # ========================================================
+    # VALIDATION OUTIL
+    # ========================================================
+
+    def _valider_arguments_outil(
+        self,
+        outil: Callable[..., Any],
+        arguments: Dict[str, Any],
+    ) -> tuple[bool, str]:
+
+        if not isinstance(arguments, dict):
+            return False, "Les arguments doivent être un objet."
+
         try:
-            mc = RE_CONFIRME.match(msg)
-            if mc:
-                aid = mc.group(1)
-                with self._lock:
-                    pending = self._actions_en_attente.pop(aid, None)
-                if not pending:
-                    return ReponseAgent("Action à confirmer introuvable/expirée.", 0.6, metadata={"categorie": cat, "timings": {"ROUTER": round(t_router,4)}})
-                args = dict(pending.get("args") or {})
-                args["confirmer"] = True
-                return self._executer(pending["outil"], args)
+            signature = inspect.signature(outil)
 
-            if RE_AUTORISE.match(msg):
-                return self._autoriser(RE_AUTORISE.match(msg).group(1))
-            if RE_REJET.match(msg):
-                return self._rejeter(RE_REJET.match(msg).group(1))
-            if low.strip(" .!?") in {"liste", "list", "propositions", "en attente"}:
+        except Exception as exc:
+            return False, (
+                f"Signature de l'outil inaccessible : {exc}"
+            )
+
+        params = signature.parameters
+
+        accepte_kwargs = any(
+            param.kind
+            == inspect.Parameter.VAR_KEYWORD
+            for param in params.values()
+        )
+
+        for nom in arguments:
+
+            if nom not in params and not accepte_kwargs:
+                return False, (
+                    f"Argument inconnu : {nom}"
+                )
+
+        try:
+            signature.bind(**arguments)
+
+        except TypeError as exc:
+            return False, str(exc)
+
+        return True, ""
+
+    # ========================================================
+    # SÉCURITÉ
+    # ========================================================
+
+    def _est_sensible(
+        self,
+        message: str,
+    ) -> bool:
+
+        return securite.est_texte_sensible(
+            message
+        )
+
+    # ========================================================
+    # OUTILS DISPONIBLES
+    # ========================================================
+
+    def _outils_specs(self) -> List[Dict[str, Any]]:
+        """
+        Décrit les outils disponibles pour le LLM (planifier()).
+
+        Priorité à la spec déclarée dans tools/__init__.py
+        (description soignée + schéma JSON, notamment les champs
+        "confirmer" marqués required pour les actions destructives) ;
+        repli sur l'introspection Python pure (_tool_spec) pour les
+        outils fournis hors registre (ex. tests, outils ad hoc).
+        """
+
+        specs: List[Dict[str, Any]] = []
+
+        for nom, fonction in self.outils.items():
+
+            if not callable(fonction):
+                continue
+
+            try:
+                spec_registre = TOOLS_REGISTRY.get(nom)
+
+                if (
+                    isinstance(spec_registre, dict)
+                    and spec_registre.get("parameters")
+                ):
+                    specs.append({
+                        "name": nom,
+                        "description": (
+                            spec_registre.get("description")
+                            or f"Outil JIBI : {nom}"
+                        ),
+                        "parameters": spec_registre.get(
+                            "parameters",
+                            {
+                                "type": "object",
+                                "properties": {},
+                                "required": [],
+                            },
+                        ),
+                    })
+
+                else:
+                    specs.append(
+                        self._tool_spec(
+                            nom,
+                            fonction,
+                        )
+                    )
+
+            except Exception:
+                logger.exception(
+                    "Impossible de décrire l'outil %s",
+                    nom,
+                )
+
+        return specs
+
+    # ========================================================
+    # CLASSIFICATION STRICTE
+    # ========================================================
+
+    def _classification_stricte(
+        self,
+        message: str,
+    ) -> Optional[str]:
+        """
+        Classification locale réduite aux cas ÉVIDENTS uniquement.
+        
+        Retourne None si le message est ambigu et doit passer au LLM.
+        """
+        
+        msg_lower = message.lower().strip()
+        
+        # ============================================================
+        # CAS ÉVIDENTS - Autorisation/Rejet
+        # ============================================================
+        
+        if re.match(
+            r"^j(?:[''])?autorise\s+[a-z0-9_-]+",
+            msg_lower,
+        ):
+            return "CONFIRMATION"
+            
+        if re.match(
+            r"^(?:je\s+)?rejet(?:te|e)\s+[a-z0-9_-]+",
+            msg_lower,
+        ):
+            return "REJET"
+            
+        if re.match(
+            r"^(?:confirme|oui)\s+[a-z0-9_-]+",
+            msg_lower,
+        ):
+            return "CONFIRMATION"
+        
+        # ============================================================
+        # CAS ÉVIDENTS - Listes/État
+        # ============================================================
+        
+        if msg_lower in {
+            "liste",
+            "liste propositions",
+            "propositions",
+            "liste des propositions",
+        }:
+            return "LISTE"
+            
+        if msg_lower in {
+            "état",
+            "etat",
+            "statut",
+            "status",
+        }:
+            return "ETAT"
+        
+        # ============================================================
+        # CAS ÉVIDENTS - Diagnostic SYSTÈME (très spécifique)
+        # ============================================================
+        
+        diagnostic_system_patterns = [
+            r"^diagnostic\s+(?:système|systeme|complet|technique)",
+            r"^fais\s+un\s+diagnostic\s+(?:système|systeme|du\s+système)",
+            r"^vérifie\s+(?:la\s+)?santé\s+(?:du\s+)?système",
+            r"^analyse\s+(?:la\s+)?santé\s+(?:du\s+)?projet",
+        ]
+        
+        for pattern in diagnostic_system_patterns:
+            if re.search(pattern, msg_lower):
+                return "DIAGNOSTIC"
+        
+        # ============================================================
+        # CAS ÉVIDENTS - Analyse de code (avec fichier/module explicite)
+        # ============================================================
+        
+        if re.search(
+            r"(?:analyse|inspecte|examine)\s+(?:le\s+)?(?:fichier\s+)?[a-z0-9_/.-]+\.py",
+            msg_lower,
+        ):
+            return "ANALYSE_CODE"
+        
+        # ============================================================
+        # CAS ÉVIDENTS - Recherche web
+        # ============================================================
+        
+        if msg_lower.startswith(("recherche ", "cherche sur ", "google ")):
+            return "RECHERCHE"
+            
+        # ============================================================
+        # CAS ÉVIDENTS - URLs
+        # ============================================================
+        
+        if re.search(r"https?://", message):
+            return "OUVRIR_URL"
+        
+        # ============================================================
+        # CAS ÉVIDENTS - Modification fichier (avec nom explicite)
+        # ============================================================
+        
+        if re.search(
+            r"(?:modifie|corrige|répare)\s+(?:le\s+fichier\s+)?[a-z0-9_/.-]+\.py",
+            msg_lower,
+        ):
+            return "MODIFIER_FICHIER"
+        
+        # ============================================================
+        # CAS ÉVIDENTS - Création outil (nom explicite)
+        # ============================================================
+        
+        if re.search(
+            r"(?:crée|créé|cree|créer|create)\s+(?:un\s+)?outil\s+(?:appelé\s+)?[a-z_][a-z0-9_]*",
+            msg_lower,
+        ):
+            return "CREER_OUTIL"
+        
+        # ============================================================
+        # TOUT LE RESTE → None (laissé au LLM)
+        # ============================================================
+        
+        # Les questions commençant par des mots interrogatifs
+        # sont des QUESTIONS, pas des diagnostics
+        if msg_lower.startswith((
+            "comment",
+            "pourquoi",
+            "qu'est-ce",
+            "quel",
+            "quelle",
+            "explique",
+            "décris",
+            "montre",
+            "dis-moi",
+        )):
+            return None  # Laisse le LLM décider
+        
+        return None
+
+    # ========================================================
+    # MESSAGE PRINCIPAL
+    # ========================================================
+
+    def traiter_message(
+        self,
+        message: str,
+    ) -> ReponseAgent:
+
+        if not isinstance(message, str):
+            message = str(message)
+
+        message = router.normaliser_message(
+            message
+        )
+
+        if not message:
+            return ReponseAgent(
+                "Je n'ai reçu aucun message.",
+                1.0,
+                "DISCUSSION",
+            )
+
+        # ============================================================
+        # ÉTAPE 1 : Classification stricte (cas évidents uniquement)
+        # ============================================================
+        
+        intention = self._classification_stricte(
+            message
+        )
+
+        if intention is not None:
+
+            if intention == "DIAGNOSTIC":
+                return self._diagnostic()
+
+            if intention == "ETAT":
+                return self._etat()
+
+            if intention == "LISTE":
                 return self._liste()
-            if cat == "SALUTATION":
-                return ReponseAgent("Salut ! Je suis JIBI, ton assistant local. Dis-moi ce que tu veux faire, ou tape « aide » pour voir les commandes.", 0.9, metadata={"categorie": cat, "timings": {"ROUTER": round(t_router,4)}})
-            if cat == "RECHERCHE":
-                requete = re.sub(r"^(cherche|recherche|trouve)\s*(moi\s*)?", "", msg, flags=re.I).strip()
-                if not requete:
-                    requete = msg
-                rep = self._rechercher(requete)
-                rep.metadata.update({"categorie": cat, "timings": {"ROUTER": round(t_router,4)}})
-                return rep
-            if cat == "DIAGNOSTIC":
-                if cancel_event and cancel_event.is_set():
-                    return ReponseAgent("⏹️ Annulé.", 0.9, metadata={"categorie": cat})
-                rep = self._diagnostic(creer_propositions=True)
-                rep.metadata.update({"categorie": cat})
-                return rep
 
-            # ==========================================
-            # FIX 2 : ROUTER LOCAL FICHIER AVANT LLM
-            # ==========================================
-            if any(k in low for k in ("améliore", "ameliore", "modifie", "change", "corrige", "optimise", "design")):
-                fichiers = self._trouver_fichiers(msg)
-                if not fichiers and ("design" in low or "interface" in low or "couleur" in low):
-                    fichiers = ["gui.py"]
-                if fichiers:
-                    return self._modifier_fichier(fichiers[0], msg.split(":",1)[-1].strip())
+            if intention == "ANALYSE_CODE":
+                return self._analyser_code(
+                    message
+                )
 
-            ml = RE_LIS_URL.match(msg)
-            if ml:
-                url = ml.group(1)
-                if get_tool("lire_page"):
-                    return self._executer("lire_page", {"url": url, "max_caracteres": 4000})
-                return ReponseAgent("⚠️ Outil lire_page indisponible.", 0.5)
-            url = self.url_directe_pour_message(msg)
-            if url and get_tool("ouvrir_url"):
-                return self._executer("ouvrir_url", {"url": url})
-            if RE_CREATION.match(msg):
-                m = RE_CREATION.match(msg)
-                return self._creer_outil(m.group(1), m.group(2))
-            ml = RE_LANCE.match(msg)
-            if ml:
-                nom_outil = ml.group(1)
-                if nom_outil in (_list_tools_cached() or {}):
-                    args = self._parse_args(ml.group(2) or "")
-                    return self._executer(nom_outil, args)
-            parties = msg.split(None, 1)
-            first = parties[0] if parties else ""
-            if first and first in (_list_tools_cached() or {}):
-                rest = msg[len(first):].strip()
-                return self._executer(first, self._parse_args(rest))
-            if (("voir" in low and "code" in low) or ("lire" in low and "code" in low)):
-                if get_tool("lire_code_source"):
-                    rep = None
-                    for f in ("core/agent_core.py", "gui.py", "tools/__init__.py"):
-                        rep = self._executer("lire_code_source", {"chemin": f})
-                        if "❌" not in rep.texte:
-                            return rep
-                    if rep:
-                        return rep
-                return ReponseAgent("⚠️ Outil lire_code_source indisponible.", 0.5)
+            if intention == "RECHERCHE":
+                return self._rechercher(message)
 
-            if self._doit_appeler_llm(msg):
-                if cerveau and self._est_discussion_simple(msg):
-                    try:
-                        if on_chunk or cancel_event:
-                            texte = cerveau.completer(msg, profil="CONVERSATION", stream=bool(on_chunk), on_chunk=on_chunk, cancel_event=cancel_event)
-                        else:
-                            texte = cerveau.completer(msg, profil="CONVERSATION")
-                        return ReponseAgent(texte, 0.85, metadata={"categorie": cat, "profil": "CONVERSATION", "timings": {"ROUTER": round(t_router,4)}})
-                    except Exception:
-                        pass
-                llm_ok = self._llm_disponible()
-                if llm_ok:
-                    try:
-                        return self._router_llm(msg, on_chunk=on_chunk, cancel_event=cancel_event, categorie=cat, t_router=t_router)
-                    except Exception:
-                        return self._router_regles(msg, low)
-            return self._router_regles(msg, low)
-        except Exception as e:
-            self._nombre_erreurs += 1
-            return ReponseAgent(f"❌ Erreur interne : {e}", 0.2, metadata={"categorie": cat, "timings": {"ROUTER": round(t_router,4)}})
+            if intention == "OUVRIR_URL":
+                return self._ouvrir_url(message)
 
-    def _router_llm(self, msg: str, on_chunk=None, cancel_event=None, categorie="TACHE_COMPLEXE", t_router=0) -> ReponseAgent:
-        if self._est_discussion_simple(msg):
-            texte = cerveau.completer(msg, profil="CONVERSATION", stream=bool(on_chunk), on_chunk=on_chunk, cancel_event=cancel_event)
-            return ReponseAgent(texte, 0.85, metadata={"categorie": categorie, "profil": "CONVERSATION"})
-        if categorie == "FICHIER":
-            fichiers = self._trouver_fichiers(msg)
-            if fichiers:
-                return self._modifier_fichier(fichiers[0], msg.split(":",1)[-1].strip() or msg)
-        if categorie == "CODE" and cerveau:
-            try:
-                if len(msg) < 500:
-                    texte = cerveau.completer(msg, profil="CODE", stream=bool(on_chunk), on_chunk=on_chunk, cancel_event=cancel_event)
-                    return ReponseAgent(texte, 0.85, metadata={"categorie": categorie, "profil": "CODE"})
-            except Exception:
-                pass
-        plan = cerveau.planifier(msg, contexte="Outils disponibles : " + ", ".join(list(_list_tools_cached())[:60]))
-        it = plan.get("intention", "discussion")
-        desc = (plan.get("description") or msg)
-        if (it == "modifier_fichier" and plan.get("fichier")):
-            return self._modifier_fichier(plan["fichier"], desc)
-        if (it == "creer_outil" and plan.get("nom_outil")):
-            return self._creer_outil(plan["nom_outil"], desc)
-        if it == "diagnostic":
-            return self._diagnostic(creer_propositions=True)
-        if it == "rechercher_web":
-            return self._rechercher(plan.get("requete") or msg)
-        if (it == "executer_outil" and plan.get("nom_outil")):
-            return self._executer(plan["nom_outil"], plan.get("arguments") or {})
-        if it == "etat":
+            if intention == "CONFIRMATION":
+                return self._autoriser(message)
+
+            if intention == "REJET":
+                return self._rejeter(message)
+
+            if intention == "MODIFIER_FICHIER":
+                return self._modifier_fichier(
+                    message
+                )
+
+            if intention == "CREER_OUTIL":
+                return self._creer_outil(
+                    message
+                )
+
+            if intention == "EXECUTER_OUTIL":
+                return self._executer(
+                    message
+                )
+
+        # ============================================================
+        # ÉTAPE 2 : LLM pour cas ambigus
+        # ============================================================
+
+        if not self._llm_disponible():
+
+            return ReponseAgent(
+                "Je n'ai pas compris la demande et le LLM est indisponible.",
+                0.4,
+                "INCONNU",
+                False,
+            )
+
+        try:
+            plan = cerveau.planifier(
+                message
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur planification"
+            )
+
+            return ReponseAgent(
+                f"Erreur de planification : {exc}",
+                0.2,
+                "ERREUR",
+                False,
+            )
+
+        plan = router.extraire_plan(
+            plan
+        )
+
+        intention = router.normaliser_intention(
+            plan.get("intention")
+        )
+
+        # ============================================================
+        # ÉTAPE 3 : Routage selon plan LLM
+        # ============================================================
+
+        if intention == "DIAGNOSTIC":
+            return self._diagnostic()
+
+        if intention == "ETAT":
             return self._etat()
-        if it == "liste":
+
+        if intention == "LISTE":
             return self._liste()
-        reponse = plan.get("reponse")
-        if reponse:
-            return ReponseAgent(reponse, 0.85, metadata={"categorie": categorie})
-        texte = cerveau.completer(msg, profil="QUESTION" if categorie=="QUESTION" else "CONVERSATION", stream=bool(on_chunk), on_chunk=on_chunk, cancel_event=cancel_event)
-        return ReponseAgent(texte, 0.85, metadata={"categorie": categorie})
 
-    def _router_regles(self, msg: str, low: str) -> ReponseAgent:
-        if RE_SALUTATION.match(low):
-            return ReponseAgent("Salut ! Je suis JIBI, ton assistant local. Dis-moi ce que tu veux faire, ou tape « aide » pour voir les commandes.", 0.9)
-        if (any(low.startswith(k) for k in ("cherche", "trouve", "recherche")) or "sur internet" in low or "sur le net" in low):
-            requete = re.sub(r"^(cherche|trouve|recherche)\s*(moi\s*)?", "", msg, flags=re.I)
-            return self._rechercher(requete)
-        if ("diagnosti" in low or ("devrais" in low and ("améliorer" in low or "ameliorer" in low))):
-            return self._diagnostic(creer_propositions=True)
-        if any(k in low for k in ("améliore", "ameliore", "modifie", "change", "corrige", "optimise", "design")):
-            fichiers = self._trouver_fichiers(msg)
-            if not fichiers and ("design" in low or "interface" in low or "couleur" in low):
-                fichiers = ["gui.py"]
-            if not fichiers:
-                return ReponseAgent("🔍 Précise le fichier : ex. 'Améliore gui.py : fond plus sombre'", 0.6)
-            return self._modifier_fichier(fichiers[0], msg.split(":",1)[-1].strip())
-        if low.strip(" .!?") in {"status", "statut", "santé", "sante", "état", "etat", "score"}:
-            return self._etat()
-        if low.strip(" .!?") in {"aide", "help", "commandes", "commande", "?"}:
-            return self._aide(low)
-        if (self._llm_disponible() and cerveau):
+        if intention == "ANALYSE_CODE":
+            return self._analyser_code(
+                message,
+                plan,
+            )
+
+        if intention == "RECHERCHE":
+            requete = str(
+                plan.get(
+                    "requete",
+                    message,
+                )
+            )
+
+            return self._rechercher(
+                requete
+            )
+
+        if intention == "MODIFIER_FICHIER":
+            return self._modifier_fichier(
+                message,
+                plan,
+            )
+
+        if intention == "CREER_OUTIL":
+            return self._creer_outil(
+                message,
+                plan,
+            )
+
+        if intention == "EXECUTER_OUTIL":
+            return self._executer(
+                message,
+                plan,
+            )
+
+        if intention == "OUVRIR_URL":
+            return self._ouvrir_url(message)
+
+        if intention == "TACHE_COMPLEXE":
+            return self._tache_complexe(
+                message,
+                plan,
+            )
+
+        # ============================================================
+        # PAR DÉFAUT : Question conversationnelle → Cerveau
+        # ============================================================
+
+        return self._question(
+            message
+        )
+
+    # ========================================================
+    # DIAGNOSTIC
+    # ========================================================
+
+    def _diagnostic(self) -> ReponseAgent:
+
+        if self._orchestrateur is not None:
+
             try:
-                return ReponseAgent(cerveau.completer(msg, profil="CONVERSATION"), 0.8)
-            except Exception:
-                pass
-        return self._aide(low)
+                resultat = (
+                    self._orchestrateur.diagnostiquer()
+                )
 
-    def _modifier_fichier(self, fichier: str, demande: str) -> ReponseAgent:
-        fichier = fichier.replace("\\", "/")
-        bloque, raison = evolution.protege(fichier)
-        if bloque:
-            return ReponseAgent(f"🚫 {raison}\nCe fichier ne se modifie qu'à la main (frein de sécurité).", 0.9)
-        cible = DEPOT_DIR / fichier
-        if not cible.exists():
-            return ReponseAgent(f"❌ {fichier} n'existe pas. Pour créer : 'Crée un outil nom : description'", 0.6)
-        if (self._llm_disponible() and cerveau):
-            contenu = cible.read_text(encoding="utf-8", errors="replace")
-            nouveau = cerveau.reecrire_fichier(fichier, contenu, demande)
-            res = evolution.proposer(fichier, demande, nouveau, origine="cerveau")
-            if not res.get("proposition"):
-                return ReponseAgent(f"⚠️ {res.get('message')}", 0.5)
-            p = res["proposition"]
-            self._nombre_ameliorations_proposees += 1
-            etat = "✅ tests labo OK" if res["ok"] else "❌ tests labo échoués (autorisation impossible)"
-            return ReponseAgent("🧪 Proposition prête (fichier réel intact)\n\n"
-                              f"  • ID : {p['id']}\n"
-                              f"  • Fichier : {fichier}\n"
-                              f"  • {etat}\n"
-                              f"  {res['message']}\n\n"
-                              f"🔍 Diff Viewer → ID {p['id']}\n"
-                              f"🔐 J'AUTORISE {p['id']}   |   🚫 Rejette {p['id']}", 0.9,
-                              amelioration_proposee=True, requiere_autorisation=True, proposition_id=p["id"])
-        r = preparer_amelioration(fichier=fichier, probleme=demande, solution=demande[:300], justification="Demande utilisateur", priorite="moyenne")
-        pid = (r.get("proposition") or {}).get("id")
-        return ReponseAgent(f"🔧 (mode sans LLM) Proposition {pid or '—'} pour {fichier}.\n"
-                          "⚠️ Configure JIBI_LLM_URL/MODEL pour activer le cerveau.\n"
-                          + (f"J'AUTORISE {pid}" if pid else f"⚠️ {r.get('message')}"), 0.7, proposition_id=pid)
+                metadata = getattr(
+                    resultat,
+                    "__dict__",
+                    {},
+                ) or {}
 
-    def _creer_outil(self, nom: str, description: str) -> ReponseAgent:
-        nom = re.sub(r"[^a-z0-9_]", "_", nom.lower()).strip("_")
-        fichier = f"tools/plugins/{nom}.py"
-        if (DEPOT_DIR / fichier).exists():
-            return ReponseAgent(f"⚠️ {fichier} existe déjà → 'Améliore {fichier} : {description}'", 0.8)
-        llm_ok = (self._llm_disponible() and cerveau)
-        if llm_ok:
-            code = cerveau.creer_outil(nom, description)
-            origine = "cerveau"
-        else:
-            code = self._squelette(nom, description)
-            origine = "squelette"
-        res = evolution.proposer(fichier, f"Nouvel outil : {description}", code, origine=origine)
-        if not res.get("proposition"):
-            return ReponseAgent(f"⚠️ {res.get('message')}", 0.5)
-        p = res["proposition"]
-        self._nombre_ameliorations_proposees += 1
-        return ReponseAgent(f"🆕 Nouvel outil préparé : {fichier}\n"
-                          f"  • ID : {p['id']}\n"
-                          f"  {res['message']}\n\n"
-                          f"🔍 Relis le code (Diff Viewer) puis : J'AUTORISE {p['id']}", 0.9,
-                          amelioration_proposee=True, requiere_autorisation=True, proposition_id=p["id"])
+                details = metadata.get(
+                    "details",
+                    {},
+                ) or {}
 
-    def _diagnostic(self, creer_propositions=False) -> ReponseAgent:
-        analyse = (analyser_jibi(depuis_heures=48) if SI_OK else {})
-        lignes = [f"🩺 DIAGNOSTIC JIBI — score {analyse.get('score_sante', '?')}/100"]
-        for pat in analyse.get("patterns_recurrents", [])[:5]:
-            lignes.append(f"  🔁 {pat.get('message', '?')[:80]} (×{pat.get('frequence', '?')})")
-        if not (self._llm_disponible() and cerveau):
-            lignes.append("\n⚠️ Sans LLM je ne peux pas analyser mon code.")
-            return ReponseAgent("\n".join(lignes), 0.7)
-        fichiers = {f: (DEPOT_DIR / f).read_text(encoding="utf-8", errors="replace")
-                    for f in MODIFIABLES_DIAG if (DEPOT_DIR / f).exists()}
-        idees = cerveau.diagnostiquer(analyse, fichiers)
-        if not idees:
-            lignes.append("\nAucune amélioration identifiée.")
-            return ReponseAgent("\n".join(lignes), 0.8)
-        lignes.append(f"\n💡 {len(idees)} amélioration(s) identifiée(s) :")
-        propositions_ids = []
-        if creer_propositions:
-            # Chaque idée = 1 appel LLM séquentiel (reecrire_fichier) ; sur un petit modèle local
-            # ça coûte cher. On ne génère les correctifs que pour les idées prioritaires.
-            ordre_prio = {"haute": 0, "moyenne": 1, "basse": 2}
-            idees_triees = sorted(idees, key=lambda d: ordre_prio.get((d.get("priorite") or "moyenne").lower(), 1))
-            MAX_CORRECTIFS = 3
-            idees_retenues = idees_triees[:MAX_CORRECTIFS]
-            if len(idees) > len(idees_retenues):
-                lignes.append(f"  (génération limitée aux {len(idees_retenues)} idées les plus prioritaires sur {len(idees)} — dis « génère la N » pour une idée précise)")
-            lignes.append("\n🛠️ Génération des correctifs...")
-            for i, idee in enumerate(idees_retenues, 1):
-                f_cible = idee.get("fichier")
-                if not f_cible or f_cible not in fichiers:
-                    lignes.append(f"  {i}. ⚠️ Fichier cible introuvable : {f_cible}")
-                    continue
-                desc = idee.get("description", "")
+                observation = details.get(
+                    "observation"
+                )
+
+                diagnostic = details.get(
+                    "diagnostic"
+                )
+
+                lignes = [
+                    "🔍 DIAGNOSTIC JIBI",
+                    "",
+                    f"État : {getattr(diagnostic, 'niveau', 'INCONNU')}",
+                    f"Message : {getattr(diagnostic, 'message', getattr(resultat, 'message', ''))}",
+                ]
+
+                if observation is not None:
+
+                    sante = getattr(
+                        observation,
+                        "sante",
+                        None,
+                    )
+
+                    if sante is not None:
+
+                        lignes.extend([
+                            "",
+                            "📊 SANTÉ DU SYSTÈME",
+                            f"Score : {getattr(sante, 'score', '?')}/100",
+                            f"Niveau : {getattr(sante, 'niveau', '?')}",
+                            f"Erreurs : {getattr(sante, 'erreurs', 0)}",
+                            f"Avertissements : {getattr(sante, 'warnings', 0)}",
+                            f"Patterns récurrents : {getattr(sante, 'patterns_recurrents', 0)}",
+                        ])
+
+                hypotheses = getattr(
+                    diagnostic,
+                    "hypotheses",
+                    [],
+                ) or []
+
+                fichiers = getattr(
+                    diagnostic,
+                    "fichiers_candidats",
+                    [],
+                ) or []
+
+                if hypotheses:
+
+                    lignes.extend([
+                        "",
+                        "🧠 HYPOTHÈSES",
+                    ])
+
+                    lignes.extend(
+                        f"• {h}"
+                        for h in hypotheses
+                    )
+
+                if fichiers:
+
+                    lignes.extend([
+                        "",
+                        "📁 FICHIERS CONCERNÉS",
+                    ])
+
+                    lignes.extend(
+                        f"• {f}"
+                        for f in fichiers
+                    )
+
+                erreurs = getattr(
+                    diagnostic,
+                    "erreurs_analysees",
+                    0,
+                )
+
+                warnings = getattr(
+                    diagnostic,
+                    "warnings_analyses",
+                    0,
+                )
+
+                lignes.extend([
+                    "",
+                    "📋 ANALYSE",
+                    f"Erreurs analysées : {erreurs}",
+                    f"Avertissements analysés : {warnings}",
+                ])
+
+                # ------------------------------------------------------
+                # Analyse statique complémentaire (detecteur.py)
+                #
+                # diagnostiquer() ne lit que les logs d'exécution passés ;
+                # analyser_et_proposer() fait tourner le vrai détecteur
+                # statique (imports morts, complexité, appels dangereux,
+                # secrets, incohérences d'architecture...) sur le code
+                # source lui-même. Lecture seule, jamais de patch généré
+                # ici (modification_production=False côté orchestrateur).
+                # ------------------------------------------------------
+                groupes_statiques = None
+
                 try:
-                    nouveau = cerveau.reecrire_fichier(f_cible, fichiers[f_cible], desc)
-                    res = evolution.proposer(f_cible, f"Auto-Fix: {idee.get('titre','')}", nouveau, origine="auto_diagnostic")
-                    if res.get("proposition"):
-                        pid = res["proposition"]["id"]
-                        propositions_ids.append(pid)
-                        etat = "✅ Tests OK" if res["ok"] else "⚠️ Tests échoués"
-                        lignes.append(f"  {i}. [{pid}] {f_cible} — {etat}")
-                    else:
-                        lignes.append(f"  {i}. ❌ Échec création : {res.get('message')}")
-                except Exception as e:
-                    lignes.append(f"  {i}. ❌ Erreur : {str(e)[:60]}")
-            if propositions_ids:
-                lignes.append("\n👉 Allez dans 'Évolutions' pour voir les diffs et AUTORISER les IDs ci-dessus.")
-                return ReponseAgent("\n".join(lignes), 0.95, proposition_id=propositions_ids[0])
-        lignes.append("\nDemande: « génère la 1 » si tu veux que je prépare UNE proposition.")
-        return ReponseAgent("\n".join(lignes), 0.9)
+                    resultat_statique = (
+                        self._orchestrateur.analyser_et_proposer(
+                            utiliser_llm=False,
+                        )
+                    )
 
-    def _rechercher(self, requete: str) -> ReponseAgent:
-        try:
-            from tools.web_search import rechercher, formater_resultats
-        except Exception:
-            return ReponseAgent("⚠️ tools/web_search.py manquant.", 0.4)
-        typ = ("videos" if any(k in (requete or "").lower() for k in ("vidéo", "video", "youtube")) else "web")
-        r = rechercher(requete, 8, typ)
-        if not r.get("ok"):
-            return ReponseAgent(f"❌ Recherche impossible : {r.get('erreur')}", 0.4)
-        txt = formater_resultats(r)
-        return ReponseAgent(txt + "\n\nDis « lis <url> » pour lire une page.", 0.9)
+                    details_statique = getattr(
+                        resultat_statique,
+                        "details",
+                        {},
+                    ) or {}
 
-    def _executer(self, nom: str, args: dict) -> ReponseAgent:
-        fn = get_tool(nom)
-        if not fn:
-            return ReponseAgent(f"Outil '{nom}' inconnu.", 0.5)
-        spec = self._tool_spec(nom) or {}
-        schema = spec.get("parametres")
-        ok, msg, args2 = self._valider_schema(schema, args or {})
-        if not ok:
-            return ReponseAgent(f"❌ {nom} : {msg}\nSchéma: {json.dumps(schema, ensure_ascii=False)}", 0.6)
-        if self._est_sensible(nom, args2, schema):
-            action_id = uuid.uuid4().hex[:10]
-            with self._lock:
-                self._actions_en_attente[action_id] = {"outil": nom, "args": args2}
-            return ReponseAgent("⚠️ Action sensible.\nRésumé: " + nom + "(" + str(args2) + ")\nConfirme: CONFIRME " + action_id, 0.85, action_requise={"type": "confirmation", "id": action_id, "outil": nom, "args": args2})
-        try:
-            r = (fn(**args2) if args2 else fn())
-            self._nombre_actions_succes += 1
-            return ReponseAgent(f"🔧 {nom} → {str(r)[:1500]}", 0.9)
-        except Exception as e:
-            self._nombre_erreurs += 1
-            return ReponseAgent(f"❌ {nom} : {e}", 0.5)
+                    groupes_statiques = details_statique.get(
+                        "groupes",
+                        [],
+                    ) or []
 
-    def _autoriser(self, pid: str) -> ReponseAgent:
-        conf = f"J'AUTORISE {pid}"
-        if evolution.charger(pid):
-            r = evolution.appliquer(pid, conf)
-        else:
-            r = autoriser_et_appliquer(proposition_id=pid, confirmation=conf, commentaire="via chat")
-        if r.get("succes"):
-            self._nombre_ameliorations_appliquees += 1
-            note = ("\n\n🎨 gui.py modifié : relance JIBI pour voir le nouveau design." if r.get("fichier") == "gui.py" else "")
-            return ReponseAgent("✅ APPLIQUÉ\n" + f"  • {r.get('fichier')}\n" + f"  • backup : {r.get('backup')}" + note, 0.99, proposition_id=pid)
-        self._nombre_erreurs += 1
-        return ReponseAgent(f"❌ {r.get('erreur') or r.get('message')}", 0.5, proposition_id=pid)
+                    if getattr(resultat_statique, "ok", False) and groupes_statiques:
 
-    def _rejeter(self, pid: str) -> ReponseAgent:
-        if evolution.charger(pid):
-            r = evolution.rejeter(pid, "via chat")
-        else:
-            r = rejeter_proposition(prop_id=pid, commentaire="via chat")
-        return ReponseAgent(f"🚫 {pid} rejetée." if r.get("ok") else f"❌ {r.get('message')}", 0.9)
+                        lignes.extend([
+                            "",
+                            "🔎 ANALYSE STATIQUE (code source)",
+                        ])
 
-    def _liste(self) -> ReponseAgent:
-        props = (evolution.lister("en_attente") + evolution.lister("tests_echoues") + list(lister_propositions_en_attente() or []))
-        if not props:
-            return ReponseAgent("📋 Aucune proposition en attente.", 0.9)
-        out = [f"📋 {len(props)} proposition(s) :"]
-        for p in props[:15]:
-            out.append(f"  • [{p.get('id')}] " + f"{p.get('fichier')} — " + f"{p.get('statut')} — " + f"{p.get('probleme', '')[:60]}")
-        out.append("\nJ'AUTORISE <id>   |   Rejette <id>")
-        return ReponseAgent("\n".join(out), 0.95)
+                        for groupe in groupes_statiques[:5]:
+
+                            if not isinstance(groupe, dict):
+                                continue
+
+                            type_probleme = groupe.get("type", "inconnu")
+                            gravite = groupe.get("gravite", "inconnue")
+                            nombre = groupe.get("nombre", 0)
+
+                            lignes.append(
+                                f"• {type_probleme} "
+                                f"({gravite}, {nombre} occurrence(s))"
+                            )
+
+                except Exception:
+                    logger.exception(
+                        "Erreur analyse statique (detecteur) "
+                        "lors du diagnostic"
+                    )
+
+                if groupes_statiques is not None:
+                    metadata = {
+                        **metadata,
+                        "analyse_statique_groupes": groupes_statiques,
+                    }
+
+                return ReponseAgent(
+                    "\n".join(lignes),
+                    0.95,
+                    "DIAGNOSTIC",
+                    bool(
+                        getattr(
+                            resultat,
+                            "ok",
+                            True,
+                        )
+                    ),
+                    metadata,
+                )
+
+            except Exception as exc:
+
+                logger.exception(
+                    "Erreur orchestrateur diagnostic"
+                )
+
+        if analyser_jibi is not None:
+
+            try:
+                analyse = analyser_jibi()
+
+                return ReponseAgent(
+                    json.dumps(
+                        analyse,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    ),
+                    0.85,
+                    "DIAGNOSTIC",
+                    True,
+                )
+
+            except Exception as exc:
+
+                return ReponseAgent(
+                    f"❌ Analyse impossible : {exc}",
+                    0.2,
+                    "DIAGNOSTIC",
+                    False,
+                )
+
+        return ReponseAgent(
+            "❌ Le système de diagnostic est indisponible.",
+            0.2,
+            "DIAGNOSTIC",
+            False,
+        )
+
+    # ========================================================
+    # ÉTAT
+    # ========================================================
 
     def _etat(self) -> ReponseAgent:
-        a = (analyser_jibi(depuis_heures=24) if SI_OK else {})
-        s = a.get("score_sante", 100)
-        self._derniere_analyse_sante = {"score": s, "date": datetime.now().isoformat()}
-        llm = self._llm_disponible()
-        model = (getattr(cerveau, "MODEL", "?") if (llm and cerveau) else "OFF")
-        return ReponseAgent(f"Santé {s}/100 " + f"({a.get('niveau_sante', '?')})" +
-                            f"\n  • Erreurs 24h : " + f"{a.get('nombre_erreurs', 0)}   " +
-                            f"• Cerveau LLM : " + f"{('✅ ' + model) if llm else '❌ OFF'}" +
-                            f"\n  • Outils : " + f"{len(_list_tools_cached() or {})}", 0.95)
 
-    def _aide(self, low: str) -> ReponseAgent:
-        return ReponseAgent("Commandes :\n" +
-                           "  • Status / Liste / J'AUTORISE <id> / Rejette <id>\n" +
-                           "  • Va sur google | ouvre github | lis https://...\n" +
-                           "  • Lance <outil> {json} (ou key=value)\n" +
-                           "  • Cherche <requête>\n", 0.8)
+        if tableau_de_bord is not None:
 
-    def _trouver_fichiers(self, txt: str) -> List[str]:
-        matches = RE_FICHIER.findall(txt or "")
-        if not matches:
-            return []
-        out: List[str] = []
-        for raw in matches:
-            c = (raw.replace("\\", "/").strip().lstrip("./"))
-            if "/" in c:
-                if (DEPOT_DIR / c).is_file() and c not in out:
-                    out.append(c)
-                continue
-            for cand in (c, f"tools/{c}", f"tools/plugins/{c}"):
-                if (DEPOT_DIR / cand).is_file() and cand not in out:
-                    out.append(cand)
-                    break
-        if len(out) > 1:
-            out = sorted(out, key=lambda p: (p.count("/"), len(p)), reverse=True)
-            out = [out[0]]
-        return out
+            try:
+                resultat = tableau_de_bord()
 
-    @staticmethod
-    def _squelette(nom, description):
-        return (f'"""{description}"""\n\n' +
-                f"def {nom}(**kwargs) -> dict:\n" +
-                f'    """{description}"""\n' +
-                f'    return {{"ok": True, "outil": "{nom}", "parametres": kwargs, "message": "à compléter"}}\n\n\n' +
-                f'OUTILS = {{"{nom}": {{"fonction": {nom}, "description": "{description[:100]}", "parametres": {{"type": "object", "properties": {{}}, "required": []}}}}}}\n')
+                return ReponseAgent(
+                    str(resultat),
+                    0.9,
+                    "ETAT",
+                )
 
-    def _log(self, t, d=""):
-        with self._lock:
-            self._historique.append({"type": t, "detail": d[:200], "timestamp": datetime.now().isoformat()})
-            self._nombre_actions_total += 1
+            except Exception as exc:
+                logger.debug(
+                    "Tableau de bord indisponible : %s",
+                    exc,
+                )
+
+        if analyser_jibi is not None:
+
+            try:
+                analyse = analyser_jibi()
+
+                return ReponseAgent(
+                    json.dumps(
+                        analyse,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    ),
+                    0.8,
+                    "ETAT",
+                )
+
+            except Exception as exc:
+
+                return ReponseAgent(
+                    f"❌ État indisponible : {exc}",
+                    0.2,
+                    "ETAT",
+                    False,
+                )
+
+        return ReponseAgent(
+            "État JIBI indisponible.",
+            0.3,
+            "ETAT",
+            False,
+        )
+
+    # ========================================================
+    # LISTE
+    # ========================================================
+
+    def _liste(self) -> ReponseAgent:
+
+        if self._orchestrateur is None:
+
+            return ReponseAgent(
+                "📋 Orchestrateur indisponible.",
+                0.3,
+                "LISTE",
+                False,
+            )
+
+        try:
+            propositions = (
+                self._orchestrateur.lister_propositions()
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur liste propositions"
+            )
+
+            return ReponseAgent(
+                f"❌ Impossible de lire les propositions : {exc}",
+                0.2,
+                "LISTE",
+                False,
+            )
+
+        if not propositions:
+
+            return ReponseAgent(
+                "📋 Aucune proposition disponible.",
+                0.8,
+                "LISTE",
+            )
+
+        lignes = [
+            f"📋 {len(propositions)} proposition(s)"
+        ]
+
+        for proposition in propositions:
+
+            if isinstance(proposition, dict):
+
+                pid = proposition.get(
+                    "id",
+                    proposition.get(
+                        "proposal_id",
+                        "?",
+                    ),
+                )
+
+                fichier = proposition.get(
+                    "fichier",
+                    proposition.get(
+                        "file",
+                        "?",
+                    ),
+                )
+
+                statut = proposition.get(
+                    "statut",
+                    proposition.get(
+                        "status",
+                        "proposition",
+                    ),
+                )
+
+                lignes.append(
+                    f"• [{pid}] "
+                    f"{fichier} — "
+                    f"{statut}"
+                )
+
+            else:
+                lignes.append(
+                    f"• {proposition}"
+                )
+
+        lignes.extend([
+            "",
+            "J'AUTORISE <id>",
+            "Rejette <id>",
+        ])
+
+        return ReponseAgent(
+            "\n".join(lignes),
+            0.95,
+            "LISTE",
+        )
+
+    # ========================================================
+    # ANALYSE CODE
+    # ========================================================
+
+    def _analyser_code(
+        self,
+        message: str,
+        plan: Optional[dict] = None,
+    ) -> ReponseAgent:
+        """
+        Analyse un fichier ou module Python sans modification.
+        """
+
+        fichier = None
+
+        if isinstance(plan, dict):
+            fichier = plan.get("fichier")
+
+        if not fichier:
+            match = re.search(
+                r"[a-z0-9_/.-]+\.py",
+                message.lower(),
+            )
+            if match:
+                fichier = match.group(0)
+
+        if not fichier:
+            return ReponseAgent(
+                "Quel fichier dois-je analyser ?",
+                0.6,
+                "ANALYSE_CODE",
+            )
+
+        fichier = str(fichier).strip()
+
+        # Vérification sécurité (lecture seule)
+        if not securite.valider_securite_fichier(
+            fichier,
+            modification=False,
+        ):
+            return ReponseAgent(
+                "❌ Fichier refusé par la politique de sécurité.",
+                0.1,
+                "ANALYSE_CODE",
+                False,
+                {
+                    "fichier": fichier,
+                    "securite": False,
+                },
+            )
+
+        if analyseur_code is None:
+            return ReponseAgent(
+                "❌ Module d'analyse de code indisponible.",
+                0.2,
+                "ANALYSE_CODE",
+                False,
+            )
+
+        try:
+            resultat = analyseur_code.analyser_fichier(
+                fichier
+            )
+
+            # Génération du résumé
+            resume = analyseur_code.resume_analyse(
+                resultat
+            )
+
+            # Ajout de détails si demandé
+            details_lignes = []
+
+            if resultat.syntaxe_valide:
+                if resultat.classes:
+                    details_lignes.append(
+                        "\n📦 CLASSES :"
+                    )
+                    for classe in resultat.classes[:5]:
+                        details_lignes.append(
+                            f"  • {classe.nom} "
+                            f"(ligne {classe.ligne}, "
+                            f"{len(classe.methodes)} méthodes)"
+                        )
+                    if len(resultat.classes) > 5:
+                        details_lignes.append(
+                            f"  ... et {len(resultat.classes) - 5} autres"
+                        )
+
+                if resultat.fonctions:
+                    details_lignes.append(
+                        "\n🔧 FONCTIONS :"
+                    )
+                    for fonction in resultat.fonctions[:5]:
+                        async_marker = "async " if fonction.async_ else ""
+                        args_preview = ", ".join(fonction.arguments[:3])
+                        if len(fonction.arguments) > 3:
+                            args_preview += "..."
+                        details_lignes.append(
+                            f"  • {async_marker}{fonction.nom}({args_preview})"
+                        )
+                    if len(resultat.fonctions) > 5:
+                        details_lignes.append(
+                            f"  ... et {len(resultat.fonctions) - 5} autres"
+                        )
+
+                if resultat.imports:
+                    details_lignes.append(
+                        f"\n📥 IMPORTS : {len(resultat.imports)} modules"
+                    )
+
+            texte_final = resume
+            if details_lignes:
+                texte_final += "\n" + "\n".join(details_lignes)
+
+            return ReponseAgent(
+                texte_final,
+                0.95,
+                "ANALYSE_CODE",
+                resultat.syntaxe_valide,
+                {
+                    "fichier": fichier,
+                    "analyse": resultat.to_dict(),
+                },
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Erreur analyse code"
+            )
+
+            return ReponseAgent(
+                f"❌ Erreur d'analyse : {exc}",
+                0.2,
+                "ANALYSE_CODE",
+                False,
+            )
+
+    # ========================================================
+    # QUESTION
+    # ========================================================
+
+    def _question(
+        self,
+        message: str,
+    ) -> ReponseAgent:
+
+        try:
+            texte = cerveau.completer(
+                message,
+                profil="QUESTION",
+                stream=False,
+            )
+
+            return ReponseAgent(
+                texte,
+                0.9,
+                "QUESTION",
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur LLM question"
+            )
+
+            return ReponseAgent(
+                f"❌ Erreur LLM : {exc}",
+                0.2,
+                "QUESTION",
+                False,
+            )
+
+    # ========================================================
+    # TÂCHE COMPLEXE
+    # ========================================================
+
+    def _tache_complexe(
+        self,
+        message: str,
+        plan: Optional[dict] = None,
+    ) -> ReponseAgent:
+
+        if isinstance(plan, dict) and plan:
+
+            return ReponseAgent(
+                json.dumps(
+                    plan,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                0.75,
+                "TACHE_COMPLEXE",
+            )
+
+        try:
+            nouveau_plan = cerveau.planifier(
+                message
+            )
+
+            nouveau_plan = router.extraire_plan(
+                nouveau_plan
+            )
+
+            return ReponseAgent(
+                json.dumps(
+                    nouveau_plan,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                0.75,
+                "TACHE_COMPLEXE",
+            )
+
+        except Exception as exc:
+
+            return ReponseAgent(
+                f"❌ Planification impossible : {exc}",
+                0.2,
+                "TACHE_COMPLEXE",
+                False,
+            )
+
+    # ========================================================
+    # MODIFICATION FICHIER
+    # ========================================================
+
+    def _modifier_fichier(
+        self,
+        message: str,
+        plan: Optional[dict] = None,
+    ) -> ReponseAgent:
+
+        if self._orchestrateur is None:
+
+            return ReponseAgent(
+                "❌ Orchestrateur indisponible.",
+                0.2,
+                "MODIFIER_FICHIER",
+                False,
+            )
+
+        fichier = None
+
+        if isinstance(plan, dict):
+            fichier = plan.get(
+                "fichier"
+            )
+
+        if not fichier:
+
+            match = re.search(
+                r"(?:fichier|file)\s+[`\"']?([^`\"'\s]+)",
+                message,
+                re.IGNORECASE,
+            )
+
+            if match:
+                fichier = match.group(1)
+
+        if not fichier:
+
+            return ReponseAgent(
+                "Quel fichier dois-je analyser ?",
+                0.6,
+                "MODIFIER_FICHIER",
+            )
+
+        fichier = str(fichier).strip()
+
+        if not securite.valider_securite_fichier(
+            fichier,
+            modification=True,
+        ):
+            return ReponseAgent(
+                "❌ Fichier refusé par la politique de sécurité.",
+                0.1,
+                "MODIFIER_FICHIER",
+                False,
+                {
+                    "fichier": fichier,
+                    "securite": False,
+                },
+            )
+
+        try:
+
+            resultat = (
+                self._orchestrateur.preparer_reparation(
+                    fichier=fichier,
+                    demande=message,
+                )
+            )
+
+            return ReponseAgent(
+                str(
+                    getattr(
+                        resultat,
+                        "message",
+                        resultat,
+                    )
+                ),
+                0.85,
+                "MODIFIER_FICHIER",
+                bool(
+                    getattr(
+                        resultat,
+                        "ok",
+                        True,
+                    )
+                ),
+                getattr(
+                    resultat,
+                    "__dict__",
+                    {},
+                ),
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Préparation modification impossible"
+            )
+
+            return ReponseAgent(
+                f"❌ Préparation impossible : {exc}",
+                0.2,
+                "MODIFIER_FICHIER",
+                False,
+            )
+
+    # ========================================================
+    # CRÉATION OUTIL
+    # ========================================================
+
+    def _creer_outil(
+        self,
+        message: str,
+        plan: Optional[dict] = None,
+    ) -> ReponseAgent:
+
+        nom = None
+        description = message
+
+        if isinstance(plan, dict):
+
+            nom = plan.get(
+                "nom_outil"
+            )
+
+            description = plan.get(
+                "description",
+                message,
+            )
+
+        if not nom:
+
+            match = re.search(
+                r"(?:outil|fonction|tool)\s+"
+                r"([a-zA-Z_][a-zA-Z0-9_]*)",
+                message,
+                re.IGNORECASE,
+            )
+
+            if match:
+                nom = match.group(1)
+
+        if not nom:
+
+            return ReponseAgent(
+                "Quel est le nom de l'outil ?",
+                0.6,
+                "CREER_OUTIL",
+            )
+
+        nom = str(nom).strip()
+
+        if not re.fullmatch(
+            r"[a-zA-Z_][a-zA-Z0-9_]{0,63}",
+            nom,
+        ):
+            return ReponseAgent(
+                "❌ Nom d'outil invalide.",
+                0.1,
+                "CREER_OUTIL",
+                False,
+            )
+
+        if nom in self.outils:
+
+            return ReponseAgent(
+                f"❌ L'outil existe déjà : {nom}",
+                0.1,
+                "CREER_OUTIL",
+                False,
+            )
+
+        try:
+
+            code = cerveau.creer_outil(
+                nom,
+                str(
+                    description or message
+                ),
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Génération outil impossible"
+            )
+
+            return ReponseAgent(
+                f"❌ Création impossible : {exc}",
+                0.2,
+                "CREER_OUTIL",
+                False,
+            )
+
+        return ReponseAgent(
+            "🛠️ Outil généré comme proposition. "
+            "Il doit être validé et testé avant toute installation.",
+            0.8,
+            "CREER_OUTIL",
+            True,
+            {
+                "nom": nom,
+                "code": code,
+                "production_modifiee": False,
+                "installe": False,
+                "necessite_validation": True,
+            },
+        )
+
+    # ========================================================
+    # EXÉCUTION OUTIL
+    # ========================================================
+
+    def _executer(
+        self,
+        message: str,
+        plan: Optional[dict] = None,
+    ) -> ReponseAgent:
+
+        nom = None
+        arguments: Dict[str, Any] = {}
+
+        if isinstance(plan, dict):
+
+            nom = plan.get(
+                "nom_outil"
+            )
+
+            valeur = plan.get(
+                "arguments",
+                {},
+            )
+
+            if isinstance(
+                valeur,
+                dict,
+            ):
+                arguments = valeur
+
+        if not nom:
+
+            match = re.search(
+                r"(?:outil|tool)\s+"
+                r"([a-zA-Z_][a-zA-Z0-9_]*)",
+                message,
+                re.IGNORECASE,
+            )
+
+            if match:
+                nom = match.group(1)
+
+        if not nom:
+
+            return ReponseAgent(
+                "Quel outil dois-je exécuter ?",
+                0.6,
+                "EXECUTER_OUTIL",
+            )
+
+        nom = str(nom).strip()
+
+        outil = self.outils.get(
+            nom
+        )
+
+        if outil is None:
+
+            return ReponseAgent(
+                f"❌ Outil inconnu : {nom}",
+                0.2,
+                "EXECUTER_OUTIL",
+                False,
+            )
+
+        if not re.fullmatch(
+            r"[a-zA-Z_][a-zA-Z0-9_]{0,63}",
+            nom,
+        ):
+            return ReponseAgent(
+                "❌ Nom d'outil invalide.",
+                0.1,
+                "EXECUTER_OUTIL",
+                False,
+            )
+
+        valide, erreur = (
+            self._valider_arguments_outil(
+                outil,
+                arguments,
+            )
+        )
+
+        if not valide:
+
+            return ReponseAgent(
+                f"❌ Arguments invalides : {erreur}",
+                0.1,
+                "EXECUTER_OUTIL",
+                False,
+                {
+                    "outil": nom,
+                    "arguments_valides": False,
+                },
+            )
+
+        try:
+
+            resultat = outil(
+                **arguments
+            )
+
+            logger.info(
+                "Outil exécuté : %s",
+                nom,
+            )
+
+            return ReponseAgent(
+                str(resultat),
+                0.9,
+                "EXECUTER_OUTIL",
+                True,
+                {
+                    "outil": nom,
+                    "arguments_valides": True,
+                },
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur outil %s",
+                nom,
+            )
+
+            return ReponseAgent(
+                f"❌ Erreur outil : {exc}",
+                0.2,
+                "EXECUTER_OUTIL",
+                False,
+            )
+
+    # ========================================================
+    # AUTORISATION
+    # ========================================================
+
+    _DECLENCHEUR_AUTORISATION_RE = re.compile(
+        r"^\s*(?:je\s+)?j?'?(?:autorise|confirme|rejette|refuse)\b[\s:,-]*",
+        re.IGNORECASE,
+    )
+
+    def _extraire_id_proposition(
+        self,
+        message: str,
+    ) -> Optional[str]:
+
+        reste = self._DECLENCHEUR_AUTORISATION_RE.sub(
+            "",
+            message,
+            count=1,
+        )
+
+        match = re.search(
+            r"\b([a-zA-Z0-9][a-zA-Z0-9_-]{3,127})\b",
+            reste,
+        )
+
+        if not match:
+            return None
+
+        return match.group(1)
+
+    def _autoriser(
+        self,
+        message: str,
+    ) -> ReponseAgent:
+
+        if self._orchestrateur is None:
+
+            return ReponseAgent(
+                "❌ Orchestrateur indisponible.",
+                0.2,
+                "CONFIRMATION",
+                False,
+            )
+
+        proposition_id = (
+            self._extraire_id_proposition(
+                message
+            )
+        )
+
+        if not proposition_id:
+
+            return ReponseAgent(
+                "Indique l'identifiant de la proposition.",
+                0.6,
+                "CONFIRMATION",
+            )
+
+        try:
+
+            resultat = (
+                self._orchestrateur.autoriser(
+                    proposition_id
+                )
+            )
+
+            return ReponseAgent(
+                str(
+                    getattr(
+                        resultat,
+                        "message",
+                        resultat,
+                    )
+                ),
+                0.9,
+                "CONFIRMATION",
+                bool(
+                    getattr(
+                        resultat,
+                        "ok",
+                        True,
+                    )
+                ),
+                {
+                    "proposition_id":
+                        proposition_id,
+                },
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Autorisation impossible"
+            )
+
+            return ReponseAgent(
+                f"❌ Autorisation impossible : {exc}",
+                0.2,
+                "CONFIRMATION",
+                False,
+            )
+
+    # ========================================================
+    # REJET
+    # ========================================================
+
+    def _rejeter(
+        self,
+        message: str,
+    ) -> ReponseAgent:
+
+        if self._orchestrateur is None:
+
+            return ReponseAgent(
+                "❌ Orchestrateur indisponible.",
+                0.2,
+                "REJET",
+                False,
+            )
+
+        proposition_id = (
+            self._extraire_id_proposition(
+                message
+            )
+        )
+
+        if not proposition_id:
+
+            return ReponseAgent(
+                "Indique l'identifiant de la proposition.",
+                0.6,
+                "REJET",
+            )
+
+        try:
+
+            resultat = (
+                self._orchestrateur.rejeter(
+                    proposition_id
+                )
+            )
+
+            return ReponseAgent(
+                str(
+                    getattr(
+                        resultat,
+                        "message",
+                        resultat,
+                    )
+                ),
+                0.9,
+                "REJET",
+                bool(
+                    getattr(
+                        resultat,
+                        "ok",
+                        True,
+                    )
+                ),
+                {
+                    "proposition_id":
+                        proposition_id,
+                },
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Rejet impossible"
+            )
+
+            return ReponseAgent(
+                f"❌ Rejet impossible : {exc}",
+                0.2,
+                "REJET",
+                False,
+            )
+
+    # ========================================================
+    # RECHERCHE
+    # ========================================================
+
+    def _rechercher(
+        self,
+        message: str,
+    ) -> ReponseAgent:
+
+        requete = re.sub(
+            r"^(recherche|cherche|"
+            r"cherche sur le web|"
+            r"recherche sur le web|google)\s*",
+            "",
+            message,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        if not requete:
+
+            return ReponseAgent(
+                "Que dois-je rechercher ?",
+                0.6,
+                "RECHERCHE",
+            )
+
+        return ReponseAgent(
+            f"🔎 Recherche demandée : {requete}",
+            0.7,
+            "RECHERCHE",
+            True,
+            {
+                "requete": requete,
+                "executee": False,
+            },
+        )
+
+    # ========================================================
+    # URL
+    # ========================================================
+
+    def _ouvrir_url(
+        self,
+        message: str,
+    ) -> ReponseAgent:
+
+        match = re.search(
+            r"https?://[^\s<>\"']+",
+            message,
+            re.IGNORECASE,
+        )
+
+        if not match:
+
+            return ReponseAgent(
+                "Je n'ai trouvé aucune URL.",
+                0.5,
+                "OUVRIR_URL",
+            )
+
+        url = match.group(0).rstrip(
+            ".,;:!?)]}"
+        )
+
+        return ReponseAgent(
+            f"🌐 URL détectée : {url}",
+            0.9,
+            "OUVRIR_URL",
+            True,
+            {
+                "url": url,
+                "ouverte": False,
+            },
+        )
+
+    # ========================================================
+    # LOG
+    # ========================================================
+
+    def _log(
+        self,
+        niveau: str,
+        message: str,
+        **kwargs: Any,
+    ) -> None:
+
+        niveau = str(
+            niveau
+        ).lower()
+
+        fonction = getattr(
+            logger,
+            niveau,
+            logger.info,
+        )
+
+        fonction(
+            "%s | %s",
+            message,
+            kwargs,
+        )
 
 
-if __name__ == "__main__":
-    print("AGENT CORE v3.5 — FULL")
-    ac = AgentCore()
-    print("AgentCore OK — traitement message test :", ac.traiter_message("bonjour").texte[:60])
+# ============================================================
+# EXPORTS
+# ============================================================
+
+__all__ = [
+    "ReponseAgent",
+    "AgentCore",
+]

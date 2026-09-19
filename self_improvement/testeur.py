@@ -1,6 +1,19 @@
 """
-Tests automatiques — PATCHÉ v2
-- Regex compilées + détection AST pour eval/exec + timings
+Tests automatiques — PATCHÉ v3.1 (corrigé)
+- Regex compilées + détection AST pour eval/exec + timings + gestion syntaxe
+
+CORRECTIFS APPLIQUÉS :
+- Suppression de l'appel à `corriger_erreur_syntaxe()`, qui n'existait
+  nulle part dans le projet (ni ici, ni dans propositions.py) et faisait
+  planter tester_et_corriger_syntaxe() dès la première erreur détectée.
+- L'import de `self_improvement.propositions` est de nouveau protégé
+  par un try/except avec fallback, comme dans la v4 d'origine, pour
+  éviter un ImportError bloquant si ce module est indisponible.
+- tester_et_corriger_syntaxe() et generer_propositions_correction()
+  utilisent maintenant `creer_proposition_correction_syntaxe(fichier,
+  erreur, solution=None)`, conformément à la règle d'architecture :
+  ce module TESTE et PROPOSE, il ne modifie JAMAIS un fichier de
+  production directement.
 """
 
 from pathlib import Path
@@ -15,6 +28,62 @@ try:
     from logging_jibi import log_event
 except Exception:
     def log_event(*a, **kw): pass
+
+def detecter_erreurs_syntaxe(fichier):
+    """Détecte les erreurs de syntaxe sans modifier le fichier."""
+    path = Path(fichier)
+
+    if not path.exists():
+        return [{
+            "type": "fichier_introuvable",
+            "message": "Fichier introuvable.",
+            "line": 0,
+            "colonne": 0,
+        }]
+
+    if not path.is_file():
+        return [{
+            "type": "chemin_invalide",
+            "message": "Le chemin n'est pas un fichier.",
+            "line": 0,
+            "colonne": 0,
+        }]
+
+    try:
+        contenu = path.read_text(encoding="utf-8-sig", errors="replace")
+        compile(contenu, str(path), "exec")
+        return []
+    except SyntaxError as erreur:
+        return [{
+            "type": "SyntaxError",
+            "message": str(erreur),
+            "line": erreur.lineno or 0,
+            "colonne": erreur.offset or 0,
+            "text": erreur.text or "",
+        }]
+    except Exception as erreur:
+        return [{
+            "type": type(erreur).__name__,
+            "message": str(erreur),
+            "line": 0,
+            "colonne": 0,
+        }]
+
+# ----------------------------------------------------------------------------
+# Import protégé : si self_improvement.propositions est indisponible,
+# des stubs sûrs prennent le relais au lieu de faire planter tout le module.
+# ----------------------------------------------------------------------------
+try:
+    from self_improvement.propositions import (
+        creer_proposition_correction_syntaxe,
+        sauvegarder_proposition
+    )
+except Exception:
+    def creer_proposition_correction_syntaxe(fichier, erreur, solution=None):
+        raise RuntimeError("self_improvement.propositions est indisponible.")
+
+    def sauvegarder_proposition(proposition):
+        raise RuntimeError("self_improvement.propositions est indisponible.")
 
 PATTERNS_DANGEREUX = [
     (r"os\.system\s*\(", "os.system() — exécution de commande"),
@@ -111,20 +180,176 @@ def tester_fichier(fichier):
     log_event("testeur", f"Test {fichier.name} → {'OK' if ok_global else 'ECHEC'} en {time.perf_counter()-t0:.3f}s")
     return {"ok": ok_global, "valide": ok_global, "fichier": str(fichier), "syntaxe": syntaxe, "securite": securite, "imports": imports, "duree": round(time.perf_counter()-t0, 3)}
 
+def tester_et_corriger_syntaxe(fichier: str) -> dict:
+    """
+    Teste la syntaxe d'un fichier et crée des propositions de correction
+    pour chaque erreur détectée.
+
+    IMPORTANT : cette fonction ne modifie JAMAIS le fichier de production.
+    Elle ne fait que détecter et proposer — l'application éventuelle d'un
+    correctif appartient au laboratoire / à l'orchestrateur, en aval.
+    """
+    t0 = time.perf_counter()
+    fichier_path = Path(fichier)
+
+    # 1. Vérification initiale
+    erreurs = detecter_erreurs_syntaxe(fichier_path)
+    if not erreurs:
+        return {
+            "ok": True,
+            "message": "Aucune erreur de syntaxe détectée",
+            "erreurs_initiales": [],
+            "propositions": [],
+            "erreurs_restantes": [],
+            "modification_appliquee": False,
+            "duree": round(time.perf_counter() - t0, 3)
+        }
+
+    # 2. Création de propositions (aucune modification directe)
+    propositions = []
+    for erreur in erreurs:
+        try:
+            proposition = creer_proposition_correction_syntaxe(
+                str(fichier_path), erreur, solution=None
+            )
+            sauvegarder_proposition(proposition)
+            propositions.append(proposition.get("id", proposition))
+        except Exception as exc:
+            log_event("testeur", f"Échec création proposition {fichier_path}: {exc}")
+
+    return {
+        "ok": False,
+        "message": (
+            f"{len(erreurs)} erreur(s) de syntaxe détectée(s). "
+            f"{len(propositions)} proposition(s) créée(s). "
+            "Aucune modification de production effectuée."
+        ),
+        "erreurs_initiales": erreurs,
+        "propositions": propositions,
+        "erreurs_restantes": erreurs,
+        "modification_appliquee": False,
+        "duree": round(time.perf_counter() - t0, 3)
+    }
+
+def tester_fichier_avec_correction(fichier: str) -> dict:
+    """
+    Teste un fichier et génère des propositions de correction de syntaxe
+    si nécessaire. Ne modifie jamais le fichier de production.
+    """
+    t0 = time.perf_counter()
+
+    # 1. Détection + propositions de correction de syntaxe
+    correction_result = tester_et_corriger_syntaxe(fichier)
+
+    # 2. Tests normaux
+    test_result = tester_fichier(fichier)
+
+    # 3. Génération de propositions supplémentaires si nécessaire
+    propositions = list(correction_result.get("propositions", []))
+    if not test_result["ok"] and not propositions:
+        propositions = generer_propositions_correction(fichier)
+
+    return {
+        "ok": test_result["ok"] and correction_result["ok"],
+        "valide": test_result["ok"] and correction_result["ok"],
+        "fichier": fichier,
+        "correction_syntaxe": correction_result,
+        "tests": test_result,
+        "propositions": propositions,
+        "modification_appliquee": False,
+        "duree": round(time.perf_counter() - t0, 3)
+    }
+
+def generer_propositions_correction(fichier: str) -> list:
+    """
+    Génère des propositions de correction pour les erreurs de syntaxe.
+    Ne modifie jamais le fichier de production.
+    """
+    fichier_path = Path(fichier)
+    erreurs = detecter_erreurs_syntaxe(fichier_path)
+
+    propositions = []
+    for erreur in erreurs:
+        try:
+            proposition = creer_proposition_correction_syntaxe(
+                str(fichier_path), erreur, solution=None
+            )
+            sauvegarder_proposition(proposition)
+            propositions.append(proposition.get("id", proposition))
+        except Exception as exc:
+            log_event("testeur", f"Échec création proposition {fichier_path}: {exc}")
+
+    return propositions
+
+def workflow_test_complet(fichier: str) -> dict:
+    """
+    Workflow complet de test avec propositions de correction de syntaxe.
+    Ne modifie jamais le fichier de production.
+    """
+    t0 = time.perf_counter()
+
+    # 1. Détection + propositions de correction de syntaxe
+    correction_result = tester_et_corriger_syntaxe(fichier)
+
+    # 2. Tests de sécurité et syntaxe
+    test_result = tester_fichier(fichier)
+
+    # 3. Génération de propositions supplémentaires si nécessaire
+    propositions = list(correction_result.get("propositions", []))
+    if not test_result["ok"] and not propositions:
+        propositions = generer_propositions_correction(fichier)
+
+    return {
+        "ok": test_result["ok"] and correction_result["ok"],
+        "valide": test_result["ok"] and correction_result["ok"],
+        "fichier": fichier,
+        "correction_syntaxe": correction_result,
+        "tests": test_result,
+        "propositions": propositions,
+        "modification_appliquee": False,
+        "duree": round(time.perf_counter() - t0, 3)
+    }
+
 def formater_rapport(rapport):
     statut = "✅ PASSÉ" if rapport["ok"] else "❌ ÉCHOUÉ"
     lignes = [
         f"🧪 Rapport de test : {statut}",
         f"   Fichier : {rapport.get('fichier', '?')}",
+        f"   Durée : {rapport.get('duree', 0)}s",
         "",
-        f"   Syntaxe : {'✅' if rapport['syntaxe']['ok'] else '❌'} {rapport['syntaxe']['message']}",
-        f"   Sécurité : {'✅' if rapport['securite']['ok'] else '⚠️'} {rapport['securite']['message']}",
     ]
-    if rapport["securite"].get("alertes"):
-        for alerte in rapport["securite"]["alertes"]:
+
+    # Correction syntaxe
+    if "correction_syntaxe" in rapport:
+        correction = rapport["correction_syntaxe"]
+        lignes.append(f"   Correction syntaxe : {'✅' if correction['ok'] else '⚠️'} {correction['message']}")
+        if correction.get("erreurs_restantes"):
+            lignes.append("     Erreurs restantes :")
+            for erreur in correction["erreurs_restantes"][:3]:
+                lignes.append(f"       • Ligne {erreur['line']}: {erreur['message']}")
+        if correction.get("propositions"):
+            lignes.append(f"     Propositions créées : {len(correction['propositions'])}")
+
+    # Tests principaux
+    lignes.append(f"   Syntaxe : {'✅' if rapport['tests']['syntaxe']['ok'] else '❌'} {rapport['tests']['syntaxe']['message']}")
+    lignes.append(f"   Sécurité : {'✅' if rapport['tests']['securite']['ok'] else '⚠️'} {rapport['tests']['securite']['message']}")
+
+    if rapport["tests"]["securite"].get("alertes"):
+        for alerte in rapport["tests"]["securite"]["alertes"][:3]:
             lignes.append(f"     ⚠️  Ligne {alerte['ligne']} : {alerte['risque']}")
-    if rapport["imports"].get("ok"):
-        lignes.append(f"   Imports : {rapport['imports']['nombre']} trouvé(s)")
+
+    if rapport["tests"]["imports"].get("ok"):
+        lignes.append(f"   Imports : {rapport['tests']['imports']['nombre']} trouvé(s)")
+
+    # Propositions
+    if rapport.get("propositions"):
+        lignes.append(f"\n   Propositions générées : {len(rapport['propositions'])}")
+        for prop_id in rapport["propositions"][:3]:
+            lignes.append(f"     • {prop_id}")
+
+    lignes.append("")
+    lignes.append("   🔒 Production modifiée : NON")
+
     return "\n".join(lignes)
 
 def executer_tests_pytest(dossier, timeout=120):
@@ -140,3 +365,10 @@ def executer_tests_pytest(dossier, timeout=120):
         return {"ok": False, "message": "pytest n'est pas installé. pip install pytest"}
     except Exception as erreur:
         return {"ok": False, "message": str(erreur)}
+
+__all__ = [
+    "tester_syntaxe", "tester_securite", "tester_imports", "tester_fichier",
+    "formater_rapport", "executer_tests_pytest",
+    "tester_et_corriger_syntaxe", "tester_fichier_avec_correction",
+    "generer_propositions_correction", "workflow_test_complet"
+]

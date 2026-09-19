@@ -76,13 +76,16 @@ class JibiApplication:
             return False
         try:
             print("🔧 Initialisation AgentCore...")
-            # Config simple (dict) : AgentCore v3.1 l'accepte
-            config = {
-                "auto_analysis_active": True,
-                "auto_preparation_active": True,
-                "auto_application_blockee": True,
-            }
-            self.agent = AgentCore(config=config)
+            # FIX (incompatibilité) : AgentCore (v8) n'accepte plus de
+            # paramètre config= — il n'accepte que outils= (dict optionnel
+            # {nom: fonction}, sinon rempli automatiquement depuis
+            # tools.TOOLS_REGISTRY). L'ancien dict config
+            # (auto_analysis_active / auto_preparation_active /
+            # auto_application_blockee) ne correspond à aucun paramètre
+            # actuel : le passer levait un TypeError silencieusement
+            # avalé par ce try/except, et self.agent restait None sans
+            # que lancer_mode_gui() ne s'en aperçoive.
+            self.agent = AgentCore()
             print("✅ AgentCore initialisé")
             return True
         except Exception as e:
@@ -95,19 +98,16 @@ class JibiApplication:
             return False
         try:
             print("🎨 Initialisation GUI...")
-            # FIX (incompatibilité) : gui.py gère son propre AgentCore en
-            # interne (thread de fond, file de réponses, annulation...) et
-            # n'a jamais lu les attributs agent_traiter_message /
-            # agent_analyser_sante — ce câblage ne faisait donc rien, et
-            # l'agent initialisé ci-dessus (avec sa config) restait orphelin
-            # pendant qu'une SECONDE instance d'AgentCore était créée en
-            # silence dans la GUI. On injecte directement l'agent déjà
-            # initialisé pour qu'il n'y en ait qu'un seul.
+            # FIX (incompatibilité) : JibiGUI.__init__ n'accepte que le
+            # paramètre agent= — pas theme_name= / titre= / geometry=,
+            # qui n'existent dans aucune version actuelle de gui.py. Les
+            # passer levait un TypeError, avalé par ce try/except, et la
+            # GUI ne s'ouvrait jamais (lancer_mode_gui() affichait juste
+            # "❌ Impossible de lancer la GUI" et s'arrêtait).
+            # On injecte l'agent déjà initialisé pour qu'il n'y en ait
+            # qu'un seul (voir commentaire ci-dessous).
             self.gui = JibiGUI(
                 agent=self.agent,
-                theme_name=self.theme,
-                titre="🤖 JIBI — Assistant IA",
-                geometry="1200x760"
             )
             print("✅ GUI initialisée")
             return True

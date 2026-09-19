@@ -1,461 +1,629 @@
-# =========================================================
-# gui_kit/sidebar.py — Barre latérale rétractable + redimensionnable
-# =========================================================
-# Trois rôles : navigation (Discussion / Propositions), historique
-# des sessions, et pied de page (modèle + état).
-#
-# Rétractation : on anime la LARGEUR du contenu vers 0 puis on
-# pack_forget le bloc. Animer place(x=...) produirait un glissement
-# haché sous Tk (recalcul géométrique complet à chaque frame) ; la
-# largeur, elle, reste fluide.
-#
-# Redimensionnement : poignée de 6 px sur le bord droit, curseur
-# sb_h_double_arrow, bornes theme.SIDEBAR_MIN..MAX.
-# =========================================================
+"""
+JIBI GUI Kit — Sidebar
+======================
+"""
+
 from __future__ import annotations
 
 import tkinter as tk
 
-from . import theme
-from .animation import Animation, animate as _animate
-from .controls import Avatar, IconButton, PillButton, draw_icon, round_rect
-from .scrollbar import ScrollArea, ThinScrollbar
-
-
-def _clamp_int(value, default: int, lo: int, hi: int) -> int:
-    """Conversion tolérante + bornage (le state ne fait aucune validation)."""
-    try:
-        v = int(value)
-    except (TypeError, ValueError):
-        v = default
-    return max(lo, min(hi, v))
-
-
-class _SessionRow(tk.Frame):
-    """Une ligne d'historique : titre + bouton supprimer au survol."""
-
-    def __init__(self, master, session, *, on_open, on_delete, bg=theme.PANEL):
-        super().__init__(master, bg=bg)
-        self.session = session
-        self._on_open = on_open
-        self._on_delete = on_delete
-        self._hover = False
-        self._active = False
-
-        self.title = tk.Label(self, text=session.get("title", "Sans titre"),
-                              bg=bg, fg=theme.TEXT_SUB, font=theme.sans(10),
-                              anchor="w", cursor="hand2")
-        self.title.pack(side="left", fill="x", expand=True, padx=(10, 2), pady=7)
-        self.meta = tk.Label(self, text=session.get("meta", ""), bg=bg,
-                             fg=theme.TEXT_FAINT, font=theme.sans(8),
-                             anchor="w", cursor="hand2")
-        self.meta.pack(side="left", padx=(0, 6))
-
-        self.del_btn = tk.Canvas(self, width=24, height=24, bg=bg,
-                                 highlightthickness=0, bd=0, cursor="hand2")
-        draw_icon(self.del_btn, "trash", 12, 12, 13, theme.TEXT_FAINT, width=2)
-        self.del_btn.pack(side="right", padx=(0, 6))
-
-        for w in (self, self.title, self.meta, self.del_btn):
-            w.bind("<Enter>", self._on_enter)
-            w.bind("<Leave>", self._on_leave)
-        self.title.bind("<Button-1>", lambda _e: self._on_open(self.session))
-        self.meta.bind("<Button-1>", lambda _e: self._on_open(self.session))
-        self.del_btn.bind("<Button-1>", lambda _e: self._on_delete(self.session))
-        self._paint()
-
-    def set_active(self, on: bool):
-        self._active = on
-        self._paint()
-
-    def _paint(self):
-        if self._active:
-            bg, fg = theme.ACCENT_SOFT, theme.TEXT
-        elif self._hover:
-            bg, fg = theme.ELEVATED, theme.TEXT
-        else:
-            bg, fg = theme.PANEL, theme.TEXT_SUB
-        for w in (self, self.title, self.meta, self.del_btn):
-            w.configure(bg=bg)
-        self.title.configure(fg=fg)
-        self.del_btn.delete("all")
-        draw_icon(self.del_btn, "trash", 12, 12, 13,
-                  theme.TEXT_FAINT if not self._hover else theme.DANGER, width=2)
-
-    def _on_enter(self, _e):
-        self._hover = True
-        self._paint()
-
-    def _on_leave(self, _e):
-        self._hover = False
-        self._paint()
+from .controls import Divider, IconButton, RoundedButton
+from .theme import COLORS, FONT, LAYOUT
 
 
 class Sidebar(tk.Frame):
-    NAV = (("chat", "Discussion", "chat"), ("proposals", "Propositions", "bulb"))
+    """
+    Sidebar JIBI.
 
-    def __init__(self, master, *, state,
-                 on_new_chat=None, on_nav=None, on_open_session=None,
-                 on_delete_session=None, on_collapse=None):
-        # Le wrapper prend le fond principal : la poignée y "colle" visuellement.
-        super().__init__(master, bg=theme.BG)
-        self._anim: Animation | None = None
+    Compatible avec gui.py v12.
+
+    Callbacks supportés :
+        on_new
+        on_chat
+        on_proposals
+        on_quit
+        on_session
+
+    API gui.py v12 :
+        on_new_chat
+        on_nav
+        on_open_session
+        on_delete_session
+        state
+    """
+
+    def __init__(
+        self,
+        master,
+        on_new=None,
+        on_chat=None,
+        on_proposals=None,
+        on_quit=None,
+        on_session=None,
+        on_new_chat=None,
+        on_nav=None,
+        on_open_session=None,
+        on_delete_session=None,
+        state=None,
+        **kwargs,
+    ):
+        # État GUI transmis par gui.py
         self.state = state
-        self._on_new_chat = on_new_chat
-        self._on_nav = on_nav
-        self._on_open_session = on_open_session
-        self._on_delete_session = on_delete_session
-        self._on_collapse = on_collapse
 
-        self._target_w = _clamp_int(state.get("sidebar_width"),
-                                    theme.SIDEBAR_DEFAULT,
-                                    theme.SIDEBAR_MIN, theme.SIDEBAR_MAX)
-        self._open = bool(state.get("sidebar_open", True))
-        self._active_nav = "chat"
-        self._selected_session = None
-        self._dragging = False
-        self._drag_x0 = 0
-        self._drag_w0 = 0
-        self._nav_buttons = {}
-        self._counts = {"chat": 0, "proposals": 0}
+        # État interne
+        self.collapsed = False
+        self.is_open = True
+        self.sessions = {}
 
-        # ---------------- contenu ----------------
-        self.content = tk.Frame(self, bg=theme.PANEL, width=self._target_w)
-        self.content.pack(side="left", fill="y")
-        self.content.pack_propagate(False)
+        # Compatibilité callbacks
+        self.on_new = on_new or on_new_chat
+        self.on_chat = on_chat
+        self.on_proposals = on_proposals
+        self.on_quit = on_quit
+
+        self.on_session = on_session or on_open_session
+
+        self.on_nav = on_nav
+        self.on_open_session = on_open_session
+        self.on_delete_session = on_delete_session
+
+        # IMPORTANT :
+        # state et les callbacks ne doivent PAS être envoyés à tk.Frame.
+        super().__init__(
+            master,
+            bg=COLORS["sidebar"],
+            width=LAYOUT["sidebar_width"],
+            **kwargs,
+        )
+
+        self.pack_propagate(False)
+
         self._build()
 
-        # ---------------- poignée de redimensionnement ----------------
-        self.handle = tk.Canvas(self, width=theme.RESIZE_HANDLE_W, bg=theme.BG,
-                                highlightthickness=0, bd=0, cursor="sb_h_double_arrow")
-        self.handle.pack(side="left", fill="y")
-        self._handle_line = None
-        self.handle.bind("<Configure>", self._draw_handle)
-        self.handle.bind("<Enter>", lambda _e: self._handle_hot(True))
-        self.handle.bind("<Leave>", lambda _e: self._handle_hot(False))
-        self.handle.bind("<Button-1>", self._drag_start)
-        self.handle.bind("<B1-Motion>", self._drag_move)
-        self.handle.bind("<ButtonRelease-1>", self._drag_end)
-        self._draw_handle()
+    # ------------------------------------------------------------------
+    # CONSTRUCTION
+    # ------------------------------------------------------------------
 
-    # ================================================== construction
     def _build(self):
-        c = self.content
+        """Construit l'interface de la sidebar."""
 
-        # ---- en-tête : logo + nom + bouton de repli
-        head = tk.Frame(c, bg=theme.PANEL)
-        head.pack(fill="x", padx=theme.SPACE_MD, pady=(theme.SPACE_LG, theme.SPACE_SM))
+        # Header
+        header = tk.Frame(
+            self,
+            bg=COLORS["sidebar"],
+        )
+        header.pack(
+            fill="x",
+            padx=16,
+            pady=(18, 8),
+        )
 
-        self.logo = tk.Canvas(head, width=30, height=30, bg=theme.PANEL,
-                              highlightthickness=0, bd=0)
-        round_rect(self.logo, 1, 1, 29, 29, 9, fill=theme.ACCENT_SOFT, outline=theme.ACCENT_DARK)
-        draw_icon(self.logo, "brain", 15, 15, 18, theme.ACCENT, width=2)
-        self.logo.pack(side="left")
+        self.title = tk.Label(
+            header,
+            text="JIBI",
+            bg=COLORS["sidebar"],
+            fg=COLORS["text_inverse"],
+            font=("Segoe UI", 19, "bold"),
+        )
+        self.title.pack(anchor="w")
 
-        tk.Label(head, text="JIBI", bg=theme.PANEL, fg=theme.TEXT,
-                 font=theme.serif(13, bold=True)).pack(side="left", padx=(10, 0))
+        self.subtitle = tk.Label(
+            header,
+            text="local · outils · labo",
+            bg=COLORS["sidebar"],
+            fg="#9a96a8",
+            font=FONT["small"],
+        )
+        self.subtitle.pack(
+            anchor="w",
+            pady=(2, 0),
+        )
 
-        IconButton(head, icon="chevron_left", command=self.collapse, kind="ghost",
-                   size=28, icon_size=15, tooltip="Masquer la barre latérale",
-                   bg=theme.PANEL).pack(side="right")
+        # Nouvelle discussion
+        self.new_button = RoundedButton(
+            self,
+            text="＋  Nouvelle discussion",
+            command=self._new,
+            bg=COLORS["accent"],
+        )
+        self.new_button.pack(
+            fill="x",
+            padx=14,
+            pady=(10, 12),
+        )
 
-        # ---- action primaire
-        pad = tk.Frame(c, bg=theme.PANEL)
-        pad.pack(fill="x", padx=theme.SPACE_MD, pady=(theme.SPACE_SM, theme.SPACE_MD))
-        PillButton(pad, text="Nouvelle discussion", icon="plus", kind="primary",
-                   height=38, command=self._fire_new_chat).pack(fill="x")
+        Divider(
+            self,
+            color=COLORS["border_dark"],
+        ).pack(
+            fill="x",
+            padx=14,
+        )
 
-        # ---- navigation
-        nav = tk.Frame(c, bg=theme.PANEL)
-        nav.pack(fill="x", padx=theme.SPACE_SM, pady=(0, theme.SPACE_MD))
-        for key, label, icon in self.NAV:
-            row = _NavRow(nav, label, icon,
-                          command=lambda k=key: self._fire_nav(k),
-                          bg=theme.PANEL)
-            row.pack(fill="x", pady=1)
-            self._nav_buttons[key] = row
+        # Navigation
+        self.nav = tk.Frame(
+            self,
+            bg=COLORS["sidebar"],
+        )
+        self.nav.pack(
+            fill="x",
+            padx=10,
+            pady=10,
+        )
 
-        # ---- historique
-        sep = tk.Frame(c, bg=theme.PANEL)
-        sep.pack(fill="x", padx=theme.SPACE_MD, pady=(theme.SPACE_SM, 4))
-        tk.Label(sep, text="HISTORIQUE", bg=theme.PANEL, fg=theme.TEXT_FAINT,
-                 font=theme.sans(8, bold=True)).pack(anchor="w")
+        self.chat_button = self._nav_button(
+            "💬  Chat",
+            self._chat,
+        )
 
-        wrap = tk.Frame(c, bg=theme.PANEL)
-        wrap.pack(fill="both", expand=True, padx=theme.SPACE_SM,
-                  pady=(0, theme.SPACE_SM))
-        self.sessions_area = ScrollArea(wrap, bg=theme.PANEL, auto_scroll=False)
-        self.sessions_area.pack(fill="both", expand=True)
-        self._session_rows = {}
+        self.proposals_button = self._nav_button(
+            "🧪  Propositions",
+            self._proposals,
+        )
 
-        # ---- pied de page : modèle + état
-        foot = tk.Frame(c, bg=theme.PANEL)
-        foot.pack(fill="x", side="bottom", padx=theme.SPACE_MD,
-                  pady=(theme.SPACE_SM, theme.SPACE_LG))
-        tk.Frame(foot, bg=theme.BORDER_SOFT, height=1).pack(fill="x", pady=(0, 10))
+        # Discussions
+        tk.Label(
+            self,
+            text="DISCUSSIONS",
+            bg=COLORS["sidebar"],
+            fg="#777286",
+            font=FONT["small_bold"],
+        ).pack(
+            anchor="w",
+            padx=18,
+            pady=(12, 6),
+        )
 
-        info = tk.Frame(foot, bg=theme.PANEL)
-        info.pack(fill="x")
-        self.dot = tk.Canvas(info, width=12, height=12, bg=theme.PANEL,
-                             highlightthickness=0, bd=0)
-        self.dot.pack(side="left", pady=2)
-        self._set_dot(theme.TEXT_FAINT)
+        self.session_frame = tk.Frame(
+            self,
+            bg=COLORS["sidebar"],
+        )
+        self.session_frame.pack(
+            fill="both",
+            expand=True,
+            padx=8,
+        )
 
-        txt = tk.Frame(info, bg=theme.PANEL)
-        txt.pack(side="left", fill="x", expand=True, padx=(8, 0))
-        self.model_lbl = tk.Label(txt, text="Modèle local", bg=theme.PANEL,
-                                  fg=theme.TEXT_SUB, font=theme.sans(9, bold=True),
-                                  anchor="w")
-        self.model_lbl.pack(fill="x")
-        self.status_lbl = tk.Label(txt, text="Connexion…", bg=theme.PANEL,
-                                   fg=theme.TEXT_FAINT, font=theme.sans(8),
-                                   anchor="w")
-        self.status_lbl.pack(fill="x")
+        # Footer
+        footer = tk.Frame(
+            self,
+            bg=COLORS["sidebar"],
+        )
+        footer.pack(
+            fill="x",
+            padx=10,
+            pady=10,
+        )
 
-    def _cancel_anim(self):
-        if self._anim is not None:
-            self._anim.cancel()
-            self._anim = None
+        self.quit_button = self._nav_button(
+            "Quitter",
+            self._quit,
+            parent=footer,
+        )
 
-    # ================================================== poignée
-    def _draw_handle(self, _e=None):
-        self.handle.delete("all")
-        h = int(self.handle.winfo_height())
-        x = theme.RESIZE_HANDLE_W / 2
-        hot = self._dragging or getattr(self, "_handle_hover", False)
-        col = theme.ACCENT if self._dragging else (theme.BORDER if hot else theme.BORDER_SOFT)
-        self.handle.create_line(x, 0, x, h, fill=col, width=1)
+    # ------------------------------------------------------------------
+    # NAVIGATION
+    # ------------------------------------------------------------------
 
-    def _handle_hot(self, on: bool):
-        self._handle_hover = on
-        self._draw_handle()
+    def _nav_button(
+        self,
+        text,
+        command,
+        parent=None,
+    ):
+        parent = parent or self.nav
 
-    def _drag_start(self, e):
-        self._dragging = True
-        self._drag_x0 = e.x_root
-        self._drag_w0 = self.width_current
-        self._cancel_anim()
-        self._draw_handle()
+        button = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            anchor="w",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            bg=COLORS["sidebar"],
+            fg="#d8d5df",
+            activebackground=COLORS["sidebar_alt"],
+            activeforeground=COLORS["text_inverse"],
+            font=FONT["body"],
+            padx=12,
+            pady=8,
+            cursor="hand2",
+        )
 
-    def _drag_move(self, e):
-        if not self._dragging:
-            return
-        w = self._drag_w0 + (e.x_root - self._drag_x0)
-        self.set_width(w)
+        button.pack(
+            fill="x",
+            pady=2,
+        )
 
-    def _drag_end(self, _e):
-        if not self._dragging:
-            return
-        self._dragging = False
-        self._target_w = self.width_current
-        self.state.set(sidebar_width=self._target_w)
-        self.state.save()
-        self._draw_handle()
+        return button
 
-    # ================================================== largeur / repli
-    @property
-    def width_current(self) -> int:
-        """Largeur visible : 0 quand la sidebar est repliée."""
-        return self._content_width() if self._open else 0
+    def _new(self):
+        if self.on_new:
+            self.on_new()
 
-    def _content_width(self) -> int:
-        """Largeur réelle du contenu, même pendant/avant une transition."""
-        return max(0, int(self.content.winfo_width()))
+    def _chat(self):
+        if self.on_chat:
+            self.on_chat()
+        elif self.on_nav:
+            self.on_nav("chat")
 
-    @property
-    def is_open(self) -> bool:
-        return self._open
+    def _proposals(self):
+        if self.on_proposals:
+            self.on_proposals()
+        elif self.on_nav:
+            self.on_nav("proposals")
 
-    def set_width(self, w: int, persist: bool = False):
-        w = int(max(theme.SIDEBAR_MIN, min(theme.SIDEBAR_MAX, w)))
-        self._target_w = w
-        self.content.configure(width=w)
-        if persist:
-            self.state.set(sidebar_width=w)
-            self.state.save()
+    def _quit(self):
+        if self.on_quit:
+            self.on_quit()
 
-    def expand(self, animate: bool = True):
-        """Réaffiche la sidebar.
+    def set_active_nav(self, view_name: str):
+        """Active le bouton de navigation correspondant."""
 
-        On ne joue JAMAIS avec pack/pack_forget ici : l'ordre de pack
-        détermine l'ordre d'allocation, et repacker ferait passer la sidebar
-        à droite de la zone centrale. On pilote uniquement les largeurs.
+        self.chat_button.configure(
+            bg=COLORS["sidebar"]
+        )
+
+        self.proposals_button.configure(
+            bg=COLORS["sidebar"]
+        )
+
+        if view_name == "chat":
+            self.chat_button.configure(
+                bg=COLORS["sidebar_alt"]
+            )
+
+        elif view_name in (
+            "proposals",
+            "propositions",
+        ):
+            self.proposals_button.configure(
+                bg=COLORS["sidebar_alt"]
+            )
+
+    # ------------------------------------------------------------------
+    # SESSIONS
+    # ------------------------------------------------------------------
+
+    def set_sessions(
+        self,
+        sessions,
+        active_session_id=None,
+    ):
         """
-        if self._open:
-            return
-        self._open = True
-        self.state.set(sidebar_open=True)
-        self.state.save()
-        self.handle.configure(width=theme.RESIZE_HANDLE_W)
-        # Réancrage EXPLICITE avant la poignée : sans `before`, le contenu
-        # repacké passerait derrière elle et inverserait les deux.
-        self.content.pack(side="left", fill="y", before=self.handle)
-        self._draw_handle()
-        if animate:
-            self.content.configure(width=0)
-            self._anim = _animate(self.content, 0, self._target_w, theme.MOTION_MS,
-                                 lambda v: self.content.configure(width=int(v)))
-        else:
-            self.content.configure(width=self._target_w)
-        if self._on_collapse:
-            self._on_collapse(True)
+        Remplace complètement la liste des discussions.
 
-    def collapse(self, animate: bool = True):
-        if not self._open:
-            return
-        self._open = False
-        self.state.set(sidebar_open=False)
-        self.state.save()
-        if animate:
-            # _content_width() et non width_current : _open vient de passer
-            # à False, width_current vaudrait déjà 0 et l'animation serait nulle.
-            self._anim = _animate(
-                self.content, self._content_width(), 0, theme.MOTION_MS,
-                lambda v: self.content.configure(width=int(v)),
-                on_done=self._hide_handle)
-        else:
-            self._hide_handle()
-        if self._on_collapse:
-            self._on_collapse(False)
+        Formats acceptés :
 
-    def toggle(self, animate: bool = True):
-        self.collapse(animate) if self._open else self.expand(animate)
+            [
+                ("id1", "Discussion 1"),
+                ("id2", "Discussion 2"),
+            ]
 
-    def _hide_handle(self):
-        """Fin de repli : le contenu est démonté (Tk arrondit width=0 à 1 px)."""
-        self.content.configure(width=0)
-        self.content.pack_forget()
-        self.handle.configure(width=0)
+        ou :
 
-    @property
-    def is_collapsed(self) -> bool:
-        return not self._open
+            [
+                {
+                    "id": "id1",
+                    "title": "Discussion 1",
+                }
+            ]
+        """
 
-    # ================================================== contenu dynamique
-    def set_nav_counts(self, *, chat: int | None = None, proposals: int | None = None):
-        if chat is not None:
-            self._counts["chat"] = chat
-        if proposals is not None:
-            self._counts["proposals"] = proposals
-        for key, row in self._nav_buttons.items():
-            row.set_count(self._counts.get(key, 0))
+        self.clear_sessions()
 
-    def set_active_nav(self, view: str):
-        self._active_nav = view
-        for key, row in self._nav_buttons.items():
-            row.set_active(key == view)
-
-    def set_sessions(self, sessions):
-        self.sessions_area.clear()
-        self._session_rows = {}
-        for s in sessions:
-            row = _SessionRow(self.sessions_area.frame, s,
-                              on_open=self._fire_open, on_delete=self._fire_delete)
-            row.pack(fill="x", pady=1)
-            self._session_rows[s.get("id")] = row
-            row.set_active(s.get("id") == self._selected_session)
         if not sessions:
-            tk.Label(self.sessions_area.frame,
-                     text="Aucune conversation\npour l'instant.",
-                     bg=theme.PANEL, fg=theme.TEXT_FAINT,
-                     font=theme.sans(9), justify="left").pack(
-                anchor="w", padx=10, pady=(10, 0))
-        self.sessions_area.bind_wheel_recursive()
+            return
 
-    def select_session(self, sid):
-        self._selected_session = sid
-        for k, row in self._session_rows.items():
-            row.set_active(k == sid)
+        for session in sessions:
 
-    def set_model(self, name: str, status: str = "", online: bool | None = None):
-        if name:
-            self.model_lbl.configure(text=name)
-        if status:
-            self.status_lbl.configure(text=status)
-        if online is not None:
-            self._set_dot(theme.ACCENT if online else theme.DANGER)
+            session_id = None
+            title = "Discussion"
 
-    def _set_dot(self, color: str):
-        self.dot.delete("all")
-        self.dot.create_oval(2, 2, 10, 10, fill=color, outline=color)
+            # Tuple / liste
+            if isinstance(session, (tuple, list)):
+                if len(session) >= 2:
+                    session_id = session[0]
+                    title = session[1]
 
-    # ================================================== callbacks
-    def _fire_new_chat(self):
-        if self._on_new_chat:
-            self._on_new_chat()
+            # Dictionnaire
+            elif isinstance(session, dict):
+                session_id = (
+                    session.get("id")
+                    or session.get("session_id")
+                )
 
-    def _fire_nav(self, key):
-        self.set_active_nav(key)
-        if self._on_nav:
-            self._on_nav(key)
+                title = (
+                    session.get("title")
+                    or session.get("name")
+                    or "Discussion"
+                )
 
-    def _fire_open(self, session):
-        self.select_session(session.get("id"))
-        if self._on_open_session:
-            self._on_open_session(session)
+            # Objet avec attributs
+            else:
+                session_id = getattr(
+                    session,
+                    "id",
+                    None,
+                )
 
-    def _fire_delete(self, session):
-        if self._on_delete_session:
-            self._on_delete_session(session)
+                if session_id is None:
+                    session_id = getattr(
+                        session,
+                        "session_id",
+                        None,
+                    )
 
+                title = (
+                    getattr(
+                        session,
+                        "title",
+                        None,
+                    )
+                    or getattr(
+                        session,
+                        "name",
+                        None,
+                    )
+                    or "Discussion"
+                )
 
-class _NavRow(tk.Frame):
-    """Entrée de navigation : icône + libellé + compteur."""
+            if session_id is None:
+                continue
 
-    def __init__(self, master, label, icon, *, command=None, bg=theme.PANEL):
-        super().__init__(master, bg=bg, cursor="hand2")
-        self._bg = bg
-        self.command = command
-        self._active = False
-        self._hover = False
+            self.add_session(
+                session_id,
+                str(title),
+                active=(
+                    session_id == active_session_id
+                ),
+            )
 
-        self.cv = tk.Canvas(self, width=18, height=18, bg=bg,
-                            highlightthickness=0, bd=0, cursor="hand2")
-        self.cv.pack(side="left", padx=(10, 9), pady=8)
-        self.lbl = tk.Label(self, text=label, bg=bg, fg=theme.TEXT_SUB,
-                            font=theme.sans(10), anchor="w", cursor="hand2")
-        self.lbl.pack(side="left", fill="x", expand=True, pady=8)
-        self.count = tk.Label(self, text="", bg=bg, fg=theme.TEXT_FAINT,
-                              font=theme.sans(8, bold=True), cursor="hand2")
-        self.count.pack(side="right", padx=(0, 10))
+    def add_session(
+        self,
+        session_id,
+        title,
+        active=False,
+    ):
+        """Ajoute une discussion."""
 
-        self._icon = icon
-        for w in (self, self.cv, self.lbl, self.count):
-            w.bind("<Enter>", self._on_enter)
-            w.bind("<Leave>", self._on_leave)
-            w.bind("<Button-1>", self._on_click)
-        self._paint()
+        if session_id in self.sessions:
+            self.update_session(
+                session_id,
+                title,
+                active,
+            )
+            return
 
-    def _paint(self):
-        if self._active:
-            bg, fg = theme.ACCENT_SOFT, theme.TEXT
-        elif self._hover:
-            bg, fg = theme.ELEVATED, theme.TEXT
+        row = tk.Frame(
+            self.session_frame,
+            bg=(
+                COLORS["sidebar_alt"]
+                if active
+                else COLORS["sidebar"]
+            ),
+        )
+
+        row.pack(
+            fill="x",
+            pady=1,
+        )
+
+        button = tk.Button(
+            row,
+            text=title,
+            anchor="w",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            bg=row["bg"],
+            fg=COLORS["text_inverse"],
+            activebackground=COLORS["sidebar_alt"],
+            activeforeground=COLORS["text_inverse"],
+            font=FONT["small"],
+            padx=12,
+            pady=8,
+            cursor="hand2",
+            command=lambda sid=session_id:
+                self._select_session(sid),
+        )
+
+        button.pack(
+            side="left",
+            fill="x",
+            expand=True,
+        )
+
+        delete_button = IconButton(
+            row,
+            text="✕",
+            kind="ghost",
+            size=22,
+            icon_size=10,
+            tooltip="Supprimer la discussion",
+            bg=row["bg"],
+            command=lambda sid=session_id:
+                self._delete_session(sid),
+        )
+
+        delete_button.pack(
+            side="right",
+            padx=(0, 6),
+        )
+
+        self.sessions[session_id] = {
+            "row": row,
+            "button": button,
+            "delete": delete_button,
+        }
+
+    def update_session(
+        self,
+        session_id,
+        title,
+        active=False,
+    ):
+        """Met à jour une discussion."""
+
+        entry = self.sessions.get(
+            session_id
+        )
+
+        if not entry:
+            self.add_session(
+                session_id,
+                title,
+                active,
+            )
+            return
+
+        bg = (
+            COLORS["sidebar_alt"]
+            if active
+            else COLORS["sidebar"]
+        )
+
+        entry["row"].configure(bg=bg)
+        entry["button"].configure(text=title, bg=bg)
+        entry["delete"].configure(bg=bg)
+
+    def remove_session(
+        self,
+        session_id,
+    ):
+        """Supprime une discussion."""
+
+        entry = self.sessions.pop(
+            session_id,
+            None,
+        )
+
+        if entry:
+            entry["row"].destroy()
+
+    def clear_sessions(self):
+        """Supprime toutes les discussions."""
+
+        for entry in self.sessions.values():
+            entry["row"].destroy()
+
+        self.sessions.clear()
+
+    def set_active(
+        self,
+        session_id,
+    ):
+        """Active visuellement une discussion."""
+
+        for sid, entry in self.sessions.items():
+            bg = (
+                COLORS["sidebar_alt"]
+                if sid == session_id
+                else COLORS["sidebar"]
+            )
+            entry["row"].configure(bg=bg)
+            entry["button"].configure(bg=bg)
+            entry["delete"].configure(bg=bg)
+
+    def select_session(self, session_id):
+        """
+        Méthode publique pour sélectionner une discussion.
+        Appelle _select_session en interne.
+        """
+        self._select_session(session_id)
+
+    def _select_session(
+        self,
+        session_id,
+    ):
+        """Sélectionne une discussion."""
+
+        self.set_active(session_id)
+
+        if self.on_session:
+            self.on_session(session_id)
+
+        elif self.on_open_session:
+            self.on_open_session(session_id)
+
+    def _delete_session(
+        self,
+        session_id,
+    ):
+        """Supprime une discussion via le bouton ✕ de la ligne."""
+
+        if self.on_delete_session:
+            self.on_delete_session(session_id)
+
+    # ------------------------------------------------------------------
+    # NAV COUNTS (méthode manquante ajoutée)
+    # ------------------------------------------------------------------
+
+    def set_nav_counts(self, chat=None, proposals=None):
+        """
+        Met à jour les compteurs de navigation.
+        Cette méthode peut être étendue pour afficher des badges.
+        """
+        # Pour l'instant, cette méthode ne fait rien visuellement
+        # mais elle existe pour éviter les AttributeError
+        pass
+
+    def set_model(self, name, detail, online=True):
+        """
+        Affiche les informations du modèle.
+        Cette méthode peut être étendue pour afficher le modèle dans la sidebar.
+        """
+        # Pour l'instant, cette méthode ne fait rien visuellement
+        # mais elle existe pour éviter les AttributeError
+        pass
+
+    # ------------------------------------------------------------------
+    # OUVERTURE / FERMETURE
+    # ------------------------------------------------------------------
+
+    def set_collapsed(
+        self,
+        collapsed: bool,
+    ):
+        """Réduit ou ouvre la sidebar."""
+
+        self.collapsed = bool(collapsed)
+        self.is_open = not self.collapsed
+
+        if self.collapsed:
+
+            self.configure(
+                width=LAYOUT["sidebar_collapsed"]
+            )
+
+            self.subtitle.pack_forget()
+
         else:
-            bg, fg = self._bg, theme.TEXT_SUB
-        for w in (self, self.cv, self.lbl, self.count):
-            w.configure(bg=bg)
-        self.lbl.configure(fg=fg)
-        self.count.configure(fg=theme.ACCENT if self._active else theme.TEXT_FAINT)
-        self.cv.delete("all")
-        draw_icon(self.cv, self._icon, 9, 9, 15,
-                  theme.ACCENT if self._active else fg, width=2)
 
-    def set_active(self, on: bool):
-        self._active = on
-        self._paint()
+            self.configure(
+                width=LAYOUT["sidebar_width"]
+            )
 
-    def set_count(self, n: int):
-        self.count.configure(text=str(n) if n else "")
+            if not self.subtitle.winfo_manager():
+                self.subtitle.pack(
+                    anchor="w",
+                    pady=(2, 0),
+                )
 
-    def _on_enter(self, _e):
-        self._hover = True
-        self._paint()
+    def toggle(self):
+        """Inverse l'état ouvert/fermé."""
 
-    def _on_leave(self, _e):
-        self._hover = False
-        self._paint()
+        self.set_collapsed(
+            not self.is_open
+        )
 
-    def _on_click(self, _e):
-        if self.command:
-            self.command()
+    def open(self):
+        """Ouvre la sidebar."""
+
+        self.set_collapsed(False)
+
+    def close(self):
+        """Ferme la sidebar."""
+
+        self.set_collapsed(True)

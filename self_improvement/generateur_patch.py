@@ -3,13 +3,18 @@
 JIBI - Générateur de patch
 ==========================
 
-Génère et décrit des modifications de code.
+Construit des objets Patch à partir de contenus candidats.
 
 IMPORTANT :
-    Ce module ne doit PAS écrire dans les fichiers de production.
+    Ce module est PUREMENT génératif.
 
-Le patch est une proposition.
-L'application réelle appartient au système transactionnel.
+    Il ne :
+        - modifie aucun fichier de production ;
+        - n'applique aucun patch ;
+        - ne crée aucune autorisation ;
+        - ne décide pas si un patch est sûr.
+
+La validation et l'application appartiennent aux autres modules.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ from typing import Any, Optional
 
 @dataclass
 class Patch:
-    """Représente une modification proposée d'un fichier."""
+    """Représente une modification proposée."""
 
     fichier: str
     ancien_contenu: str
@@ -35,21 +40,18 @@ class Patch:
 
     @property
     def hash_avant(self) -> str:
-        """Hash SHA-256 du contenu avant modification."""
         return hashlib.sha256(
             self.ancien_contenu.encode("utf-8")
         ).hexdigest()
 
     @property
     def hash_apres(self) -> str:
-        """Hash SHA-256 du contenu après modification."""
         return hashlib.sha256(
             self.nouveau_contenu.encode("utf-8")
         ).hexdigest()
 
     @property
     def nombre_lignes_ajoutees(self) -> int:
-        """Nombre de lignes ajoutées par le patch."""
         diff = difflib.unified_diff(
             self.ancien_contenu.splitlines(),
             self.nouveau_contenu.splitlines(),
@@ -64,7 +66,6 @@ class Patch:
 
     @property
     def nombre_lignes_supprimees(self) -> int:
-        """Nombre de lignes supprimées par le patch."""
         diff = difflib.unified_diff(
             self.ancien_contenu.splitlines(),
             self.nouveau_contenu.splitlines(),
@@ -81,8 +82,6 @@ class Patch:
         self,
         inclure_contenu: bool = True,
     ) -> dict[str, Any]:
-        """Convertit le patch en dictionnaire sérialisable."""
-
         data: dict[str, Any] = {
             "fichier": self.fichier,
             "raison": self.raison,
@@ -105,18 +104,13 @@ def analyser_syntaxe(
     contenu: str,
     nom: str = "<patch>",
 ) -> tuple[bool, Optional[str]]:
-    """
-    Vérifie uniquement la syntaxe Python.
-
-    Cette fonction ne modifie jamais le contenu.
-    """
+    """Vérifie la syntaxe Python sans modifier quoi que ce soit."""
 
     try:
         ast.parse(
             contenu,
             filename=nom,
         )
-
         return True, None
 
     except SyntaxError as exc:
@@ -127,17 +121,10 @@ def analyser_syntaxe(
         )
 
 
-def generer_patch(
+def lire_contenu_fichier(
     fichier: str | Path,
-    nouveau_contenu: str,
-    raison: str = "",
-    source: str = "jibi",
-) -> Patch:
-    """
-    Crée un Patch à partir d'un fichier existant.
-
-    Aucune écriture n'est effectuée.
-    """
+) -> str:
+    """Lit un fichier Python sans le modifier."""
 
     path = Path(fichier)
 
@@ -151,39 +138,92 @@ def generer_patch(
             f"Le chemin n'est pas un fichier : {path}"
         )
 
-    ancien = path.read_text(
+    return path.read_text(
         encoding="utf-8-sig",
         errors="replace",
     )
 
+
+def construire_patch(
+    fichier: str | Path,
+    ancien_contenu: str,
+    nouveau_contenu: str,
+    raison: str = "",
+    source: str = "jibi",
+    metadata: Optional[dict[str, Any]] = None,
+) -> Patch:
+    """
+    Construit un patch depuis deux contenus.
+
+    Aucune écriture disque.
+    """
+
+    if not isinstance(ancien_contenu, str):
+        raise TypeError(
+            "ancien_contenu doit être une chaîne."
+        )
+
+    if not isinstance(nouveau_contenu, str):
+        raise TypeError(
+            "nouveau_contenu doit être une chaîne."
+        )
+
+    if ancien_contenu == nouveau_contenu:
+        raise ValueError(
+            "Aucune modification détectée."
+        )
+
     valide, erreur = analyser_syntaxe(
         nouveau_contenu,
-        str(path),
+        str(fichier),
     )
 
     if not valide:
         raise ValueError(
-            f"Le nouveau contenu n'est pas valide : {erreur}"
-        )
-
-    if ancien == nouveau_contenu:
-        raise ValueError(
-            "Le patch ne contient aucune modification."
+            f"Syntaxe invalide : {erreur}"
         )
 
     return Patch(
-        fichier=str(path),
-        ancien_contenu=ancien,
+        fichier=str(Path(fichier)),
+        ancien_contenu=ancien_contenu,
         nouveau_contenu=nouveau_contenu,
         raison=raison,
         source=source,
+        metadata=metadata or {},
+    )
+
+
+def generer_patch(
+    fichier: str | Path,
+    nouveau_contenu: str,
+    raison: str = "",
+    source: str = "jibi",
+    metadata: Optional[dict[str, Any]] = None,
+) -> Patch:
+    """
+    Lit le contenu actuel et construit un patch candidat.
+
+    Cette fonction ne modifie jamais le fichier.
+    """
+
+    ancien_contenu = lire_contenu_fichier(
+        fichier
+    )
+
+    return construire_patch(
+        fichier=fichier,
+        ancien_contenu=ancien_contenu,
+        nouveau_contenu=nouveau_contenu,
+        raison=raison,
+        source=source,
+        metadata=metadata,
     )
 
 
 def generer_diff(
     patch: Patch,
 ) -> str:
-    """Génère un diff lisible du patch."""
+    """Produit le diff lisible du patch."""
 
     lignes = difflib.unified_diff(
         patch.ancien_contenu.splitlines(),
@@ -199,11 +239,7 @@ def generer_diff(
 def verifier_coherence(
     patch: Patch,
 ) -> dict[str, Any]:
-    """
-    Vérifie la cohérence minimale d'un patch.
-
-    La fonction ne modifie jamais le fichier.
-    """
+    """Effectue les contrôles de cohérence de base."""
 
     syntaxe_ok, erreur = analyser_syntaxe(
         patch.nouveau_contenu,
@@ -211,7 +247,8 @@ def verifier_coherence(
     )
 
     modification = (
-        patch.ancien_contenu != patch.nouveau_contenu
+        patch.ancien_contenu
+        != patch.nouveau_contenu
     )
 
     return {
@@ -222,8 +259,12 @@ def verifier_coherence(
         "fichier": patch.fichier,
         "hash_avant": patch.hash_avant,
         "hash_apres": patch.hash_apres,
-        "lignes_ajoutees": patch.nombre_lignes_ajoutees,
-        "lignes_supprimees": patch.nombre_lignes_supprimees,
+        "lignes_ajoutees": (
+            patch.nombre_lignes_ajoutees
+        ),
+        "lignes_supprimees": (
+            patch.nombre_lignes_supprimees
+        ),
     }
 
 
@@ -233,50 +274,25 @@ def patch_depuis_contenu(
     nouveau_contenu: str,
     raison: str = "",
     source: str = "jibi",
+    metadata: Optional[dict[str, Any]] = None,
 ) -> Patch:
-    """
-    Crée un Patch à partir de deux contenus.
+    """Construit un patch sans relire le fichier."""
 
-    Aucun accès disque et aucune écriture.
-    """
-
-    if not isinstance(ancien_contenu, str):
-        raise TypeError(
-            "ancien_contenu doit être une chaîne."
-        )
-
-    if not isinstance(nouveau_contenu, str):
-        raise TypeError(
-            "nouveau_contenu doit être une chaîne."
-        )
-
-    valide, erreur = analyser_syntaxe(
-        nouveau_contenu,
-        str(fichier),
-    )
-
-    if not valide:
-        raise ValueError(
-            f"Syntaxe invalide : {erreur}"
-        )
-
-    if ancien_contenu == nouveau_contenu:
-        raise ValueError(
-            "Aucune modification."
-        )
-
-    return Patch(
-        fichier=str(fichier),
+    return construire_patch(
+        fichier=fichier,
         ancien_contenu=ancien_contenu,
         nouveau_contenu=nouveau_contenu,
         raison=raison,
         source=source,
+        metadata=metadata,
     )
 
 
 __all__ = [
     "Patch",
     "analyser_syntaxe",
+    "lire_contenu_fichier",
+    "construire_patch",
     "generer_patch",
     "generer_diff",
     "verifier_coherence",

@@ -1,224 +1,619 @@
-"""
-Gestionnaire — PATCHÉ v2
-- Fix cohérence coherent→ok + config + timings + logs
-"""
-import os
-import json
-import shutil
-import time
-from datetime import datetime
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any
 
-from self_improvement.autorisation import examiner_proposition, valider_proposition, rejeter_proposition, marquer_appliquee, autorisation_valide
-from self_improvement.analyseur import lire_logs, analyser_logs, calculer_score_sante, detecter_patterns_recurrents, sauvegarder_analyse
-from self_improvement.propositions import creer_proposition, sauvegarder_proposition, lister_propositions, charger_proposition, obtenir_statistiques
-from self_improvement.laboratoire import creer_session, copier_fichier_dans_laboratoire, comparer_fichiers, compter_sessions
-from self_improvement.testeur import tester_fichier
-from self_improvement.validation import analyser_modification, est_fichier_sensible
-from self_improvement.versions import creer_backup, restaurer_backup, compter_backups
-from self_improvement.code_generator import generer_patch, appliquer_patch, verifier_coherence, generer_diff_lisible
+from . import analyseur
+from . import laboratoire
+from . import orchestrateur
+from . import propositions
+
 
 try:
-    from core.config import JIBI_PROJET_DIR as CFG_DEPOT
-    DEPOT_DIR = CFG_DEPOT
+    from core.config import JIBI_PROJET_DIR
 except Exception:
-    DEPOT_DIR = Path(os.getenv("JIBI_PROJET_DIR", Path(__file__).resolve().parent.parent)).resolve()
+    JIBI_PROJET_DIR = Path(__file__).resolve().parent.parent
 
-try:
-    from logging_jibi import log_event, log_warning
-except Exception:
-    def log_event(*a, **kw): pass
-    def log_warning(*a, **kw): pass
 
-def analyser_jibi(limite_logs: int = 1000, depuis_heures: int = 24) -> Dict[str, Any]:
-    t0 = time.perf_counter()
+DEPOT_DIR = Path(JIBI_PROJET_DIR).resolve()
+
+
+# ---------------------------------------------------------------------------
+# ORCHESTRATEUR
+# ---------------------------------------------------------------------------
+
+def _obtenir_orchestrateur() -> Any:
+    """
+    Retourne l'orchestrateur central.
+
+    Compatible avec :
+        - une fonction obtenir_orchestrateur()
+        - une classe Orchestrateur
+        - une instance globale orchestrateur
+    """
+
+    getter = getattr(
+        orchestrateur,
+        "obtenir_orchestrateur",
+        None,
+    )
+
+    if callable(getter):
+        return getter()
+
+    classe = getattr(
+        orchestrateur,
+        "Orchestrateur",
+        None,
+    )
+
+    if classe is not None:
+        return classe()
+
+    return orchestrateur
+
+
+# ---------------------------------------------------------------------------
+# ANALYSE
+# ---------------------------------------------------------------------------
+
+def analyser_jibi() -> dict:
+    """
+    Compatibilité historique.
+
+    L'analyse reste descriptive.
+    """
+    return analyseur.analyser_logs()
+
+
+# ---------------------------------------------------------------------------
+# PRÉPARATION D'UNE AMÉLIORATION
+# ---------------------------------------------------------------------------
+
+def preparer_amelioration(
+    fichier: str,
+    probleme: str,
+    ancien: str,
+    nouveau: str,
+    *,
+    origine: str = "agent",
+    priorite: str = "moyenne",
+) -> dict:
+    """
+    Prépare une proposition de réparation.
+
+    IMPORTANT :
+        aucune modification de production.
+    """
+
+    orch = _obtenir_orchestrateur()
+
+    fonction = getattr(
+        orch,
+        "preparer_reparation",
+        None,
+    )
+
+    if not callable(fonction):
+        return {
+            "ok": False,
+            "succes": False,
+            "message": (
+                "L'orchestrateur ne fournit pas "
+                "preparer_reparation()."
+            ),
+        }
+
     try:
-        analyse = analyser_logs(depuis_heures=depuis_heures, limite=limite_logs)
+        resultat = fonction(
+            fichier=fichier,
+            probleme=probleme,
+            ancien=ancien,
+            nouveau=nouveau,
+            origine=origine,
+            priorite=priorite,
+        )
+
     except TypeError:
-        analyse = analyser_logs(depuis_heures=depuis_heures)
-    except Exception as e:
-        return {"erreur": f"Analyse impossible : {e}"}
-    score = analyse.get("score_sante", 100)
-    patterns = analyse.get("patterns_recurrents", [])
-    recommandations = []
-    if score < 60:
-        recommandations.append("⚠️  Score critique — révision prioritaire")
-    if patterns:
-        recommandations.append(f"🔁 {len(patterns)} patterns récurrents détectés")
-    if not recommandations:
-        recommandations.append("✅ Système stable")
-    log_event("gestionnaire", f"Analyse JIBI en {time.perf_counter()-t0:.3f}s score={score}")
-    return {"timestamp": datetime.now().isoformat(), "score_sante": score, "etat": analyse.get("niveau_sante", "Inconnu"), "erreurs": analyse.get("nombre_erreurs", 0), "warnings": analyse.get("nombre_warnings", 0), "patterns_recurrents": patterns, "logs_analyses": analyse.get("logs_lignes", 0), "recommandations": recommandations, "duree": round(time.perf_counter()-t0,3)}
-
-def preparer_amelioration(fichier: str, probleme: str, solution: str, justification: str = "", priorite: str = "moyenne") -> Dict[str, Any]:
-    t0 = time.perf_counter()
-    raisons_blocage = []
-    proposition = creer_proposition(fichier=fichier, probleme=probleme, solution=solution, justification=justification, priorite=priorite)
-    sauvegarder_proposition(proposition)
-    proposition_id = proposition["id"]
-    try:
-        session_path = creer_session(f"prop_{proposition_id}")
-    except Exception as e:
-        raisons_blocage.append(f"Impossible de créer le laboratoire : {e}")
-        return _resultat_echec(proposition, raisons_blocage)
-    validation = analyser_modification(fichier, solution)
-    if validation.get("niveau") == "bloqué":
-        raisons_blocage.append(f"Sécurité BLOQUÉE : {validation.get('action','')}")
-        return _resultat_echec(proposition, raisons_blocage)
-    fichier_original = DEPOT_DIR / fichier
-    if not fichier_original.exists():
-        raisons_blocage.append(f"Fichier source introuvable : {fichier_original}")
-        return _resultat_echec(proposition, raisons_blocage)
-    if est_fichier_sensible(str(fichier_original)):
-        raisons_blocage.append(f"Fichier SENSIBLE : {fichier}")
-        return _resultat_echec(proposition, raisons_blocage)
-    fichier_lab = None
-    try:
-        fichier_lab = copier_fichier_dans_laboratoire(fichier_original, session_path)
-    except Exception as e:
-        raisons_blocage.append(f"Erreur copie labo : {e}")
-        return _resultat_echec(proposition, raisons_blocage)
-    patch = None
-    try:
-        patch = generer_patch(str(fichier_original), proposition)
-        if patch and not patch.get("ok"):
-            raisons_blocage.append(f"Patch échoué : {patch.get('message','')}")
-            return _resultat_echec(proposition, raisons_blocage)
-    except Exception as e:
-        raisons_blocage.append(f"Génération patch : {e}")
-        return _resultat_echec(proposition, raisons_blocage)
-    fichier_modifie = None
-    if patch and patch.get("ok") and fichier_lab:
+        # Compatibilité avec une signature plus ancienne.
         try:
-            fichier_modifie = Path(appliquer_patch(str(fichier_lab), patch))
-        except Exception as e:
-            raisons_blocage.append(f"Application patch labo : {e}")
-            return _resultat_echec(proposition, raisons_blocage)
-    coherence = None
-    if fichier_modifie:
+            resultat = fonction(
+                fichier,
+                probleme,
+                ancien,
+                nouveau,
+            )
+
+        except Exception as exc:
+            return {
+                "ok": False,
+                "succes": False,
+                "message": str(exc),
+                "type_erreur": type(exc).__name__,
+            }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "succes": False,
+            "message": str(exc),
+            "type_erreur": type(exc).__name__,
+        }
+
+    return resultat
+
+
+# ---------------------------------------------------------------------------
+# PROPOSITIONS
+# ---------------------------------------------------------------------------
+
+def lister_propositions(
+    statut: str | None = None,
+) -> list[dict[str, Any]]:
+    """Retourne les propositions existantes."""
+
+    orch = _obtenir_orchestrateur()
+
+    fonction = getattr(
+        orch,
+        "lister_propositions",
+        None,
+    )
+
+    if callable(fonction):
         try:
-            coherence = verifier_coherence(str(fichier_original), str(fichier_modifie))
-            if not coherence.get("ok"):
-                raisons_blocage.append(f"Incohérence : {coherence.get('message')}")
-                return _resultat_echec(proposition, raisons_blocage)
-        except Exception as e:
-            raisons_blocage.append(f"Cohérence : {e}")
-            return _resultat_echec(proposition, raisons_blocage)
-    tests = None
-    if fichier_modifie:
-        try:
-            tests = tester_fichier(str(fichier_modifie))
-            if not tests.get("valide", tests.get("ok", False)):
-                raisons_blocage.append("Tests labo échoués.")
-                return _resultat_echec(proposition, raisons_blocage)
-        except Exception as e:
-            raisons_blocage.append(f"Tests : {e}")
-            return _resultat_echec(proposition, raisons_blocage)
-    backup = None
-    try:
-        backup = creer_backup(fichier_original, raison=f"Prep {proposition_id}")
-    except Exception as e:
-        log_warning("gestionnaire", f"Backup prep échoué : {e}")
-    diff = None
-    if fichier_modifie:
-        try:
-            diff = generer_diff_lisible(str(fichier_original), str(fichier_modifie))
-        except Exception:
-            pass
-    log_event("gestionnaire", f"Prep {proposition_id} OK en {time.perf_counter()-t0:.3f}s")
-    return {"proposition": proposition, "proposition_id": proposition_id, "session": str(session_path), "fichier_source": str(fichier_original), "fichier_labo": str(fichier_modifie), "validation": validation, "patch": patch, "coherence": coherence, "tests": tests, "backup": str(backup) if backup else None, "diff": diff, "pret_pour_application": False, "raisons_blocage": raisons_blocage, "duree": round(time.perf_counter()-t0,3)}
+            resultat = fonction(
+                statut
+            )
+        except TypeError:
+            resultat = fonction()
 
-def _resultat_echec(proposition, raisons):
-    return {"proposition": proposition, "proposition_id": proposition.get("id"), "pret_pour_application": False, "raisons_blocage": raisons}
+        if isinstance(
+            resultat,
+            dict,
+        ):
+            propositions_resultat = resultat.get(
+                "propositions"
+            )
 
-def appliquer_amelioration(proposition_id: str, confirmation: str = "") -> Dict[str, Any]:
-    proposition = charger_proposition(proposition_id)
-    if not proposition:
-        return {"succes": False, "erreur": f"Proposition '{proposition_id}' introuvable."}
-    if proposition.get("statut") == "rejetee":
-        return {"succes": False, "erreur": "Proposition déjà rejetée."}
-    if not autorisation_valide(proposition_id, confirmation):
-        return {"succes": False, "erreur": f"Autorisation invalide. Format attendu : J'AUTORISE {proposition_id}"}
-    res_valid = valider_proposition(prop_id=proposition_id, confirmation=confirmation, commentaire="Validation avant application.")
-    if not res_valid.get("ok"):
-        return {"succes": False, "erreur": res_valid.get("message", "Validation refusée.")}
-    fichier_cible_str = proposition.get("fichier", "")
-    fichier_cible = DEPOT_DIR / fichier_cible_str
-    if est_fichier_sensible(fichier_cible_str):
-        return {"succes": False, "erreur": f"Fichier sensible : {fichier_cible_str}"}
-    if not fichier_cible.exists():
-        return {"succes": False, "erreur": f"Fichier absent : {fichier_cible}"}
-    try:
-        backup = creer_backup(fichier_cible, raison=f"Avant {proposition_id}")
-    except Exception as e:
-        return {"succes": False, "erreur": f"Backup impossible : {e}"}
-    sessions_dir = DEPOT_DIR / "workspace" / "jibi_lab" / "sessions"
-    session = None
-    if sessions_dir.exists():
-        for d in sorted(sessions_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-            if d.is_dir() and f"prop_{proposition_id}" in d.name:
-                session = d
-                break
-    if not session:
-        return {"succes": False, "erreur": "Session labo introuvable.", "backup": str(backup)}
-    nom_fichier = Path(fichier_cible_str).name
-    fichier_lab = session / nom_fichier
-    if not fichier_lab.exists():
-        candidats = list(session.rglob(nom_fichier))
-        if candidats:
-            fichier_lab = candidats[0]
-    if not fichier_lab.exists():
-        return {"succes": False, "erreur": "Fichier labo introuvable.", "backup": str(backup)}
-    try:
-        shutil.copy2(fichier_lab, fichier_cible)
-    except Exception as e:
-        return {"succes": False, "erreur": f"Copie impossible : {e}", "backup": str(backup)}
-    try:
-        tests_post = tester_fichier(str(fichier_cible))
-    except Exception as e:
-        tests_post = {"ok": False, "valide": False, "message": str(e)}
-    if not tests_post.get("valide", tests_post.get("ok", False)):
-        try:
-            restaurer_backup(backup, destination=fichier_cible)
-        except Exception:
-            pass
-        return {"succes": False, "erreur": "Tests post-échec. Rollback effectué.", "rollback": True, "backup": str(backup)}
-    marquer_appliquee(proposition_id)
-    return {"succes": True, "proposition_id": proposition_id, "fichier": str(fichier_cible), "backup": str(backup), "message": "Amélioration appliquée avec succès."}
+            if isinstance(
+                propositions_resultat,
+                list,
+            ):
+                return propositions_resultat
 
-def autoriser_et_appliquer(proposition_id: str, confirmation: str, commentaire: str = "") -> Dict[str, Any]:
-    res_valid = valider_proposition(prop_id=proposition_id, confirmation=confirmation, commentaire=commentaire or "Accord utilisateur.")
-    if not res_valid.get("ok"):
-        return {"succes": False, "etape": "autorisation", "message": res_valid.get("message", "Validation refusée.")}
-    return appliquer_amelioration(proposition_id=proposition_id, confirmation=confirmation)
+        if isinstance(
+            resultat,
+            list,
+        ):
+            return resultat
 
-def resoudre_probleme_persistant(depuis_heures: int = 24) -> Dict[str, Any]:
     try:
-        analyse = analyser_jibi(depuis_heures=depuis_heures)
-    except Exception as e:
-        return {"erreur": str(e)}
-    propositions = []
-    for p in analyse.get("patterns_recurrents", [])[:3]:
-        try:
-            prep = preparer_amelioration(fichier="tools/", probleme=str(p.get("message",""))[:200], solution="Correction auto (à valider)", priorite="haute")
-            if prep.get("proposition_id"):
-                propositions.append(prep["proposition_id"])
-        except Exception:
-            pass
-    return {"analyse": analyse, "propositions": propositions, "deploiement": False}
-
-def workflow_complet_amelioration(fichier: str, probleme: str, solution: str, justification: str = "", priorite: str = "moyenne", appliquer_automatiquement: bool = False) -> Dict[str, Any]:
-    if appliquer_automatiquement:
-        print("⚠️  Auto-application IGNORÉE. Autorisation humaine obligatoire.")
-    prep = preparer_amelioration(fichier=fichier, probleme=probleme, solution=solution, justification=justification, priorite=priorite)
-    return {"preparation": prep, "deploiement": False, "proposition_id": prep.get("proposition_id")}
-
-def tableau_de_bord() -> Dict[str, Any]:
-    try:
-        stats = obtenir_statistiques()
-        sessions = compter_sessions()
-        backups = compter_backups()
+        return propositions.lister_propositions(
+            statut=statut
+        )
     except Exception:
-        stats, sessions, backups = {}, 0, 0
-    return {"propositions": stats, "sessions": sessions, "backups": backups}
+        return []
+
+
+# ---------------------------------------------------------------------------
+# AUTORISATION
+# ---------------------------------------------------------------------------
+
+def autoriser(
+    proposition_id: str,
+) -> dict:
+    """
+    Autorise une proposition.
+
+    La décision est confiée à l'orchestrateur.
+    """
+
+    orch = _obtenir_orchestrateur()
+
+    fonction = getattr(
+        orch,
+        "autoriser",
+        None,
+    )
+
+    if not callable(fonction):
+        return {
+            "ok": False,
+            "succes": False,
+            "message": (
+                "L'orchestrateur ne fournit pas "
+                "autoriser()."
+            ),
+        }
+
+    try:
+        return fonction(
+            proposition_id
+        )
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "succes": False,
+            "message": str(exc),
+            "type_erreur": type(exc).__name__,
+        }
+
+
+# ---------------------------------------------------------------------------
+# REJET
+# ---------------------------------------------------------------------------
+
+def rejeter(
+    proposition_id: str,
+    raison: str = "",
+) -> dict:
+    """Rejette une proposition via l'orchestrateur."""
+
+    orch = _obtenir_orchestrateur()
+
+    fonction = getattr(
+        orch,
+        "rejeter",
+        None,
+    )
+
+    if not callable(fonction):
+        return {
+            "ok": False,
+            "succes": False,
+            "message": (
+                "L'orchestrateur ne fournit pas "
+                "rejeter()."
+            ),
+        }
+
+    try:
+        return fonction(
+            proposition_id,
+            raison,
+        )
+
+    except TypeError:
+        try:
+            return fonction(
+                proposition_id
+            )
+
+        except Exception as exc:
+            return {
+                "ok": False,
+                "succes": False,
+                "message": str(exc),
+                "type_erreur": type(exc).__name__,
+            }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "succes": False,
+            "message": str(exc),
+            "type_erreur": type(exc).__name__,
+        }
+
+
+# ---------------------------------------------------------------------------
+# APPLICATION
+# ---------------------------------------------------------------------------
+
+def appliquer_amelioration(
+    proposition_id: str,
+    confirmation: str | None = None,
+) -> dict:
+    """
+    Applique une proposition via l'orchestrateur.
+
+    Aucune modification directe par gestionnaire.py.
+    """
+
+    if confirmation is None:
+        return {
+            "ok": False,
+            "succes": False,
+            "message": (
+                "Confirmation explicite requise."
+            ),
+        }
+
+    orch = _obtenir_orchestrateur()
+
+    fonction = getattr(
+        orch,
+        "appliquer",
+        None,
+    )
+
+    if not callable(fonction):
+        return {
+            "ok": False,
+            "succes": False,
+            "message": (
+                "L'orchestrateur ne fournit pas "
+                "appliquer()."
+            ),
+        }
+
+    try:
+        return fonction(
+            proposition_id,
+            confirmation,
+        )
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "succes": False,
+            "message": str(exc),
+            "type_erreur": type(exc).__name__,
+        }
+
+
+def autoriser_et_appliquer(
+    proposition_id: str,
+) -> dict:
+    """
+    Autorisation + application contrôlée.
+
+    L'orchestrateur reste responsable de toutes
+    les vérifications de sécurité.
+    """
+
+    orch = _obtenir_orchestrateur()
+
+    fonction = getattr(
+        orch,
+        "autoriser",
+        None,
+    )
+
+    if not callable(fonction):
+        return {
+            "ok": False,
+            "succes": False,
+            "message": (
+                "Orchestrateur incomplet."
+            ),
+        }
+
+    autorisation = fonction(
+        proposition_id
+    )
+
+    if not isinstance(
+        autorisation,
+        dict,
+    ):
+        return {
+            "ok": False,
+            "succes": False,
+            "message": (
+                "Réponse d'autorisation invalide."
+            ),
+        }
+
+    if not autorisation.get(
+        "ok",
+        False,
+    ):
+        return autorisation
+
+    confirmation = (
+        f"J'AUTORISE {proposition_id}"
+    )
+
+    return appliquer_amelioration(
+        proposition_id,
+        confirmation,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PROBLÈME PERSISTANT
+# ---------------------------------------------------------------------------
+
+def resoudre_probleme_persistant(
+    depuis_heures: int = 24,
+) -> dict:
+    """
+    Prépare l'analyse d'un problème persistant.
+
+    Aucun correctif n'est appliqué automatiquement ici.
+    """
+
+    orch = _obtenir_orchestrateur()
+
+    fonction = getattr(
+        orch,
+        "diagnostiquer",
+        None,
+    )
+
+    if callable(fonction):
+
+        try:
+            diagnostic = fonction()
+
+            return {
+                "ok": True,
+                "analyse": diagnostic,
+                "propositions": [],
+                "message": (
+                    "Diagnostic préparé. "
+                    "Aucune modification automatique."
+                ),
+            }
+
+        except Exception as exc:
+            return {
+                "ok": False,
+                "succes": False,
+                "message": str(exc),
+                "type_erreur": type(exc).__name__,
+            }
+
+    analyse = analyser_jibi()
+
+    return {
+        "ok": True,
+        "analyse": analyse,
+        "propositions": [],
+        "depuis_heures": depuis_heures,
+        "message": (
+            "Diagnostic persistant préparé. "
+            "Aucune modification automatique."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# WORKFLOW
+# ---------------------------------------------------------------------------
+
+def workflow_complet_amelioration(
+    fichier: str,
+    probleme: str,
+    ancien: str,
+    nouveau: str,
+    *,
+    appliquer_automatiquement: bool = False,
+) -> dict:
+    """
+    Lance le workflow centralisé.
+
+    Le gestionnaire ne prend aucune décision de sécurité.
+    """
+
+    orch = _obtenir_orchestrateur()
+
+    workflow = getattr(
+        orch,
+        "workflow",
+        None,
+    )
+
+    if callable(workflow):
+
+        try:
+            return workflow(
+                fichier=fichier,
+                probleme=probleme,
+                ancien=ancien,
+                nouveau=nouveau,
+                appliquer_automatiquement=(
+                    appliquer_automatiquement
+                ),
+            )
+
+        except TypeError:
+            pass
+
+        except Exception as exc:
+            return {
+                "ok": False,
+                "succes": False,
+                "message": str(exc),
+                "type_erreur": type(exc).__name__,
+            }
+
+    # Compatibilité si workflow() n'existe pas encore.
+    preparation = preparer_amelioration(
+        fichier=fichier,
+        probleme=probleme,
+        ancien=ancien,
+        nouveau=nouveau,
+    )
+
+    if not preparation.get(
+        "ok",
+        False,
+    ):
+        return preparation
+
+    return {
+        "ok": True,
+        "succes": False,
+        "requiert_autorisation": True,
+        "proposition": preparation.get(
+            "proposition"
+        ),
+        "risque": preparation.get(
+            "risque",
+            {},
+        ),
+        "message": (
+            "Proposition préparée. "
+            "Autorisation requise."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# TABLEAU DE BORD
+# ---------------------------------------------------------------------------
+
+def tableau_de_bord() -> dict:
+    """
+    Retourne une vue synthétique de JIBI.
+
+    Aucune décision de réparation.
+    """
+
+    orch = _obtenir_orchestrateur()
+
+    dashboard = getattr(
+        orch,
+        "tableau_de_bord",
+        None,
+    )
+
+    if callable(dashboard):
+
+        try:
+            resultat = dashboard()
+
+            if isinstance(
+                resultat,
+                dict,
+            ):
+                return resultat
+
+        except Exception:
+            pass
+
+    return {
+        "sante": analyser_jibi(),
+        "propositions": (
+            propositions.obtenir_statistiques()
+        ),
+        "sessions_labo": (
+            laboratoire.compter_sessions()
+        ),
+        "depot": str(
+            DEPOT_DIR
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# API PUBLIQUE
+# ---------------------------------------------------------------------------
+
+__all__ = [
+    "DEPOT_DIR",
+    "analyser_jibi",
+    "preparer_amelioration",
+    "lister_propositions",
+    "autoriser",
+    "rejeter",
+    "appliquer_amelioration",
+    "autoriser_et_appliquer",
+    "resoudre_probleme_persistant",
+    "workflow_complet_amelioration",
+    "tableau_de_bord",
+]
