@@ -108,21 +108,23 @@ def ouvrir_application(nom):
         if SYSTEME == "Windows":
             # Mappage noms courants vers exécutables Windows
             mapping = {
-                "navigateur": "start msedge",
-                "firefox": "start firefox",
-                "chrome": "start chrome",
-                "explorer": "explorer",
-                "explorateur_fichiers": "explorer",
-                "terminal": "cmd /k",
-                "vscode": "code",
-                "notepad": "notepad",
-                "word": "start winword",
-                "excel": "start excel",
-                "powerpoint": "start powerpnt",
+                "navigateur": ["msedge"],
+                "firefox": ["firefox"],
+                "chrome": ["chrome"],
+                "explorer": ["explorer"],
+                "explorateur_fichiers": ["explorer"],
+                "terminal": ["cmd"],
+                "vscode": ["code"],
+                "notepad": ["notepad"],
+                "word": ["winword"],
+                "excel": ["excel"],
+                "powerpoint": ["powerpnt"],
             }
             
-            cmd = mapping.get(nom.lower().strip(), f"start {nom}")
-            subprocess.Popen(cmd, shell=True)
+            cmd = mapping.get(nom.lower().strip())
+            if cmd is None:
+                return "Application non autorisée. Applications disponibles : " + ", ".join(sorted(mapping))
+            subprocess.Popen(cmd, shell=False)
         
         elif SYSTEME == "Darwin":
             subprocess.Popen(["open", "-a", nom])

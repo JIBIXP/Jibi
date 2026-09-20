@@ -5,6 +5,12 @@ JIBI GUI Kit — Chat View
 Vue de conversation : bulles utilisateur/assistant, blocs de code
 détectés (```lang ... ```) avec bouton "Ouvrir" vers le panneau
 d'artefacts, indicateur "en train d'écrire", et suggestions.
+
+Design premium v2 :
+- Avatars circulaires (Canvas) pour JIBI et l'utilisateur
+- Bulles avec meilleures marges et séparation claire
+- Indicateur d'écriture animé plus élégant
+- Timestamps stylés intégrés dans les bulles
 """
 
 from __future__ import annotations
@@ -13,11 +19,40 @@ import re
 import tkinter as tk
 
 from . import theme
-from .controls import RoundedButton
+from .controls import RoundedButton, RoundedFrame
 from .scrollbar import ScrollArea
 
 
 _CODE_RE = re.compile(r"```(\w*)\n?(.*?)```", re.S)
+
+_JIBI_AVATAR_COLOR = theme.ACCENT
+_USER_AVATAR_COLOR = theme.ELEVATED
+
+
+def _draw_circle_avatar(parent, color, letter, bg, size=32):
+    """Dessine un avatar circulaire avec une initiale."""
+    canvas = tk.Canvas(
+        parent,
+        width=size,
+        height=size,
+        bg=bg,
+        highlightthickness=0,
+        bd=0,
+    )
+    # Cercle de fond
+    canvas.create_oval(
+        2, 2, size - 2, size - 2,
+        fill=color,
+        outline="",
+    )
+    # Initiale centrée
+    canvas.create_text(
+        size // 2, size // 2,
+        text=letter,
+        fill=theme.TEXT,
+        font=theme.sans(10, bold=True),
+    )
+    return canvas
 
 
 class _MessageRow(tk.Frame):
@@ -30,33 +65,86 @@ class _MessageRow(tk.Frame):
 
         is_user = role == "user"
 
-        header = tk.Frame(self, bg=bg)
-        header.pack(fill="x", padx=4, pady=(10, 2))
+        bubble_bg = theme.COLORS["bubble_user" if is_user else "bubble_bot"]
+        avatar_color = _USER_AVATAR_COLOR if is_user else _JIBI_AVATAR_COLOR
+        avatar_letter = "U" if is_user else "J"
+
+        # Conteneur principal avec avatar + bulle
+        row_frame = tk.Frame(self, bg=bg)
+        row_frame.pack(
+            fill="x",
+            padx=12,
+            pady=(4, 10),
+        )
+
+        # --- Avatar (côté gauche pour JIBI, droit pour user) ---
+        avatar_canvas = _draw_circle_avatar(
+            row_frame,
+            color=avatar_color,
+            letter=avatar_letter,
+            bg=bg,
+            size=34,
+        )
+
+        # --- Bulle ---
+        bubble_wrap = tk.Frame(row_frame, bg=bg)
+
+        if is_user:
+            bubble_wrap.pack(side="right", fill="x", expand=True, padx=(60, 8))
+            avatar_canvas.pack(side="right", padx=(4, 0), anchor="n", pady=4)
+        else:
+            avatar_canvas.pack(side="left", padx=(0, 8), anchor="n", pady=4)
+            bubble_wrap.pack(side="left", fill="x", expand=True, padx=(0, 60))
+
+        self.bubble = RoundedFrame(
+            bubble_wrap,
+            radius=14,
+            card_bg=bubble_bg,
+            bg=bg,
+            pad=14,
+        )
+        self.bubble.pack(fill="x")
+
+        self.body = self.bubble.body
+
+        self.header = tk.Frame(self.body, bg=bubble_bg)
+        self.header.pack(fill="x", padx=2, pady=(0, 6))
 
         tk.Label(
-            header,
+            self.header,
             text="Vous" if is_user else "JIBI",
-            bg=bg,
+            bg=bubble_bg,
             fg=theme.ACCENT if not is_user else theme.TEXT_SUB,
-            font=theme.sans(9, bold=True),
+            font=theme.sans(10, bold=True),
         ).pack(side="left")
 
         if meta:
             tk.Label(
-                header,
+                self.header,
                 text=meta,
-                bg=bg,
+                bg=bubble_bg,
                 fg=theme.TEXT_FAINT,
-                font=theme.sans(8),
+                font=theme.sans(9),
             ).pack(side="left", padx=(8, 0))
 
-        self.body = tk.Frame(self, bg=bg)
-        self.body.pack(fill="x", padx=4, pady=(0, 4))
+        self.content_frame = tk.Frame(self.body, bg=bubble_bg)
+        self.content_frame.pack(fill="x")
+        self._text_labels: list[tk.Label] = []
+
+        def _on_bubble_configure(e):
+            wrap_w = max(260, e.width - 24)
+            for lbl in self._text_labels:
+                try:
+                    lbl.configure(wraplength=wrap_w)
+                except Exception:
+                    pass
+        self.content_frame.bind("<Configure>", _on_bubble_configure)
 
     def set_text(self, text: str):
         self.current_text = text or ""
+        self._text_labels.clear()
 
-        for child in self.body.winfo_children():
+        for child in self.content_frame.winfo_children():
             child.destroy()
 
         parts = _CODE_RE.split(self.current_text)
@@ -82,20 +170,25 @@ class _MessageRow(tk.Frame):
             k += 3
 
     def _add_text(self, text: str):
-        tk.Label(
-            self.body,
+        bubble_bg = self.content_frame["bg"]
+        current_w = self.content_frame.winfo_width()
+        wrap_w = max(260, current_w - 24) if current_w > 50 else 560
+        lbl = tk.Label(
+            self.content_frame,
             text=text.strip("\n"),
-            bg=self["bg"],
+            bg=bubble_bg,
             fg=theme.TEXT,
-            font=theme.sans(10),
+            font=theme.FONT["body"],
             justify="left",
             anchor="w",
-            wraplength=560,
-        ).pack(fill="x", pady=(2, 2))
+            wraplength=wrap_w,
+        )
+        lbl.pack(fill="x", pady=(2, 2))
+        self._text_labels.append(lbl)
 
     def _add_code(self, lang: str, code: str):
         wrap = tk.Frame(
-            self.body,
+            self.content_frame,
             bg=theme.COLORS["surface"],
             highlightbackground=theme.BORDER,
             highlightthickness=1,
@@ -158,20 +251,33 @@ class _BotRowHandle:
 
 
 class _TypingRow(tk.Frame):
+    """Indicateur d'écriture animé avec trois points pulsants."""
+
     def __init__(self, master, bg):
         super().__init__(master, bg=bg)
 
         self._phase = 0
-        self.label = tk.Label(
-            self,
-            text="JIBI réfléchit…",
-            bg=bg,
-            fg=theme.TEXT_DIM,
-            font=theme.sans(9),
-        )
-        self.label.pack(anchor="w", padx=8, pady=(6, 6))
-
         self._running = True
+
+        row = tk.Frame(self, bg=bg)
+        row.pack(fill="x", padx=20, pady=(4, 8))
+
+        # Avatar JIBI pour l'indicateur
+        av = _draw_circle_avatar(row, _JIBI_AVATAR_COLOR, "J", bg, size=34)
+        av.pack(side="left", padx=(0, 8), anchor="n", pady=2)
+
+        bubble = tk.Frame(row, bg=theme.BUBBLE_BOT, padx=16, pady=10)
+        bubble.pack(side="left")
+
+        self.label = tk.Label(
+            bubble,
+            text="JIBI réfléchit…",
+            bg=theme.BUBBLE_BOT,
+            fg=theme.TEXT_DIM,
+            font=theme.sans(10),
+        )
+        self.label.pack()
+
         self._animate()
 
     def _animate(self):
@@ -179,11 +285,11 @@ class _TypingRow(tk.Frame):
             return
 
         self._phase = (self._phase + 1) % 4
-        dots = "." * self._phase
+        dots = "●" * self._phase + "○" * (3 - self._phase)
 
         try:
-            self.label.configure(text=f"JIBI réfléchit{dots}")
-            self.after(400, self._animate)
+            self.label.configure(text=f"JIBI réfléchit  {dots}")
+            self.after(350, self._animate)
         except Exception:
             self._running = False
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from .controls import IconButton, RoundedButton
+from .controls import IconButton, RoundedButton, RoundedFrame
 from .theme import COLORS, FONT
 
 
@@ -47,22 +47,27 @@ class InputBar(tk.Frame):
         self.on_mic = on_mic
 
         self._listening = False
+        self._placeholder = "Écris un message… (Shift+Entrée pour nouvelle ligne)"
+        self._placeholder_active = True
 
-        self.entry_frame = tk.Frame(
+        self.entry_frame = RoundedFrame(
             self,
-            bg=COLORS["surface"],
-            highlightbackground=COLORS["border"],
-            highlightthickness=1,
+            radius=24,
+            card_bg=COLORS["surface"],
+            bg=COLORS["bg"],
+            outline=COLORS["border"],
+            border_width=1,
+            pad=4,
         )
 
         self.entry_frame.pack(
             fill="x",
-            padx=16,
-            pady=12,
+            padx=24,
+            pady=16,
         )
 
         self.attach_button = IconButton(
-            self.entry_frame,
+            self.entry_frame.body,
             text="＋",
             command=self._attach,
             bg=COLORS["surface"],
@@ -75,14 +80,14 @@ class InputBar(tk.Frame):
         )
 
         self.entry = tk.Text(
-            self.entry_frame,
+            self.entry_frame.body,
             height=2,
             wrap="word",
             relief="flat",
             bd=0,
             highlightthickness=0,
             bg=COLORS["surface"],
-            fg=COLORS["text"],
+            fg=COLORS["text_dim"],
             insertbackground=COLORS["text"],
             font=FONT["body"],
         )
@@ -95,13 +100,19 @@ class InputBar(tk.Frame):
             pady=7,
         )
 
+        # Placeholder initial
+        self._show_placeholder()
+
+        self.entry.bind("<FocusIn>", self._on_focus_in)
+        self.entry.bind("<FocusOut>", self._on_focus_out)
+
         self.entry.bind(
             "<Return>",
             self._return,
         )
 
         self.mic_button = IconButton(
-            self.entry_frame,
+            self.entry_frame.body,
             text="🎙",
             command=self._mic,
             bg=COLORS["surface"],
@@ -114,7 +125,7 @@ class InputBar(tk.Frame):
         )
 
         self.stop_button = RoundedButton(
-            self.entry_frame,
+            self.entry_frame.body,
             text="Annuler",
             command=self._stop,
             bg=COLORS["danger"],
@@ -122,7 +133,7 @@ class InputBar(tk.Frame):
         )
 
         self.send_button = RoundedButton(
-            self.entry_frame,
+            self.entry_frame.body,
             text="Envoyer ➤",
             command=self._send,
         )
@@ -135,15 +146,44 @@ class InputBar(tk.Frame):
 
         self._set_busy(False)
 
+    # ----------------------------------------------------------------
+    # Placeholder
+
+    def _show_placeholder(self):
+        self._placeholder_active = True
+        self.entry.delete("1.0", "end")
+        self.entry.insert("1.0", self._placeholder)
+        self.entry.configure(fg=COLORS["text_dim"])
+
+    def _hide_placeholder(self):
+        if self._placeholder_active:
+            self.entry.delete("1.0", "end")
+            self.entry.configure(fg=COLORS["text"])
+            self._placeholder_active = False
+
+    def _on_focus_in(self, _event=None):
+        if self._placeholder_active:
+            self._hide_placeholder()
+
+    def _on_focus_out(self, _event=None):
+        content = self.entry.get("1.0", "end-1c").strip()
+        if not content:
+            self._show_placeholder()
+
+    # ----------------------------------------------------------------
+    # Events
+
     def _return(self, event):
+        # Shift+Entrée = nouvelle ligne
         if event.state & 0x0001:
             return
-
         self._send()
-
         return "break"
 
     def _send(self):
+        if self._placeholder_active:
+            return
+
         text = self.entry.get(
             "1.0",
             "end-1c",
@@ -151,6 +191,10 @@ class InputBar(tk.Frame):
 
         if not text:
             return
+
+        # FIX BUG 2 : vider le champ AVANT d'appeler on_send
+        self.clear()
+        self._show_placeholder()
 
         if self.on_send:
             self.on_send(text)
@@ -175,11 +219,14 @@ class InputBar(tk.Frame):
             "1.0",
             "end",
         )
+        self._placeholder_active = False
 
     def focus_input(self):
         self.entry.focus_set()
 
     def get_text(self) -> str:
+        if self._placeholder_active:
+            return ""
         return self.entry.get(
             "1.0",
             "end-1c",
@@ -190,7 +237,8 @@ class InputBar(tk.Frame):
         text: str,
     ):
         self.clear()
-
+        self._placeholder_active = False
+        self.entry.configure(fg=COLORS["text"])
         self.entry.insert(
             "1.0",
             text,
@@ -201,6 +249,8 @@ class InputBar(tk.Frame):
         text: str,
     ):
         """Insère du texte à la position du curseur, sans vider le champ."""
+        if self._placeholder_active:
+            self._hide_placeholder()
         self.entry.insert(
             "insert",
             text,

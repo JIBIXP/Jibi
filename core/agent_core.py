@@ -39,11 +39,14 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import re
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from core import cerveau
+from core import config
 from core import router
 from core import securite
 
@@ -506,36 +509,53 @@ class AgentCore:
             msg_lower,
         ):
             return "MODIFIER_FICHIER"
-        
+
         # ============================================================
-        # CAS ÉVIDENTS - Création outil (nom explicite)
+        # CAS ÉVIDENTS - Salutations & Conversation
         # ============================================================
-        
-        if re.search(
-            r"(?:crée|créé|cree|créer|create)\s+(?:un\s+)?outil\s+(?:appelé\s+)?[a-z_][a-z0-9_]*",
-            msg_lower,
-        ):
-            return "CREER_OUTIL"
-        
+        salutations = (
+            "bonjour", "salut", "hello", "hi", "coucou", "yo", "bonsoir", "hey",
+            "merci", "merci beaucoup", "au revoir", "bye", "à bientôt", "a bientot",
+            "ça va", "ca va", "comment vas-tu", "comment tu vas", "comment ca va",
+            "comment ça va", "qui es-tu", "tu es qui", "présente-toi", "presente toi",
+        )
+        if msg_lower in salutations or any(msg_lower.startswith(s + " ") for s in salutations):
+            return "DISCUSSION"
+
         # ============================================================
-        # TOUT LE RESTE → None (laissé au LLM)
+        # CAS ÉVIDENTS - Auto-amélioration / Diagnostics
         # ============================================================
-        
-        # Les questions commençant par des mots interrogatifs
-        # sont des QUESTIONS, pas des diagnostics
+        if re.search(r"^(?:auto[- ]?am[ée]lior|am[ée]liore[- ]toi|diagnostic\b|optimise[- ]toi)", msg_lower):
+            return "DIAGNOSTIC"
+
+        # ============================================================
+        # CAS ÉVIDENTS - Questions & Demandes d'aide
+        # ============================================================
         if msg_lower.startswith((
             "comment",
             "pourquoi",
             "qu'est-ce",
+            "quest-ce",
             "quel",
             "quelle",
+            "quels",
+            "quelles",
             "explique",
             "décris",
+            "decris",
             "montre",
             "dis-moi",
+            "peux-tu",
+            "est-ce que",
+            "aide-moi",
+            "donne-moi",
+            "trouve",
+            "qui ",
+            "quand ",
+            "où ",
         )):
-            return None  # Laisse le LLM décider
-        
+            return "QUESTION"
+
         return None
 
     # ========================================================
@@ -545,7 +565,17 @@ class AgentCore:
     def traiter_message(
         self,
         message: str,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        cancel_event: Any = None,
     ) -> ReponseAgent:
+
+        if cancel_event and getattr(cancel_event, "is_set", lambda: False)():
+            return ReponseAgent(
+                "Requête annulée.",
+                0.0,
+                "ANNULATION",
+                False,
+            )
 
         if not isinstance(message, str):
             message = str(message)
@@ -562,6 +592,44 @@ class AgentCore:
             )
 
         # ============================================================
+        # ÉTAPE 0 : Questions d'identité / accès → vérification réelle
+        # ============================================================
+
+        message_lower = message.lower()
+        motifs_identite = (
+            "qui es tu",
+            "tu es une ia",
+            "est-ce que tu es une ia",
+            "as-tu accès",
+            "acces a ton propre code",
+            "accès à ton propre code",
+            "tu peux lire ton code",
+            "peux-tu lire ton code",
+            "tu as accès à tes fichiers",
+        )
+
+        if any(motif in message_lower for motif in motifs_identite):
+            etat = self._verifier_etat_agent()
+            if etat["verification_ok"]:
+                return ReponseAgent(
+                    "Oui, je suis un assistant IA local. "
+                    "J’ai vérifié que le projet est accessible et que je peux lire des fichiers du code source.",
+                    0.95,
+                    "IDENTITE",
+                    True,
+                    etat,
+                )
+
+            return ReponseAgent(
+                "Je ne peux pas confirmer mon accès à cet instant, "
+                "mais je ne prétends pas avoir un accès que je n’ai pas vérifié.",
+                0.6,
+                "IDENTITE",
+                False,
+                etat,
+            )
+
+        # ============================================================
         # ÉTAPE 1 : Classification stricte (cas évidents uniquement)
         # ============================================================
         
@@ -570,6 +638,13 @@ class AgentCore:
         )
 
         if intention is not None:
+
+            if intention in ("QUESTION", "DISCUSSION"):
+                return self._question(
+                    message,
+                    on_chunk=on_chunk,
+                    cancel_event=cancel_event,
+                )
 
             if intention == "DIAGNOSTIC":
                 return self._diagnostic()
@@ -714,8 +789,56 @@ class AgentCore:
         # ============================================================
 
         return self._question(
-            message
+            message,
+            on_chunk=on_chunk,
+            cancel_event=cancel_event,
         )
+
+    # ========================================================
+    # VÉRIFICATION D'ÉTAT (IDENTITÉ / ACCÈS)
+    # ========================================================
+
+    def _verifier_etat_agent(self) -> dict[str, Any]:
+        """
+        Vérifie l'accès réel à son environnement avant de faire
+        une affirmation sur son identité ou ses fichiers.
+        """
+        projet = getattr(config, "JIBI_PROJET_DIR", None)
+        root = Path(str(projet)).resolve() if projet else Path.cwd()
+
+        fichiers_a_tester = [
+            root / "core" / "prompts.py",
+            root / "core" / "agent_core.py",
+            root / "self_improvement" / "gestionnaire.py",
+        ]
+
+        lecture_ok: list[dict[str, Any]] = []
+        for fichier in fichiers_a_tester:
+            try:
+                ok = (
+                    fichier.exists()
+                    and fichier.is_file()
+                    and os.access(fichier, os.R_OK)
+                )
+            except Exception:
+                ok = False
+
+            lecture_ok.append({
+                "fichier": str(fichier),
+                "ok": bool(ok),
+            })
+
+        return {
+            "identite": "assistant IA locale",
+            "projet": str(root),
+            "acces_code": any(item["ok"] for item in lecture_ok),
+            "lecture_fichiers": lecture_ok,
+            "outils_disponibles": bool(self.outils),
+            "verification_ok": (
+                any(item["ok"] for item in lecture_ok)
+                and bool(self.outils)
+            ),
+        }
 
     # ========================================================
     # DIAGNOSTIC
@@ -1242,13 +1365,17 @@ class AgentCore:
     def _question(
         self,
         message: str,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        cancel_event: Any = None,
     ) -> ReponseAgent:
 
         try:
             texte = cerveau.completer(
                 message,
                 profil="QUESTION",
-                stream=False,
+                stream=bool(on_chunk),
+                on_chunk=on_chunk,
+                cancel_event=cancel_event,
             )
 
             return ReponseAgent(
@@ -1358,11 +1485,54 @@ class AgentCore:
                 fichier = match.group(1)
 
         if not fichier:
+            # Raccourcis pour les composants que l'utilisateur désigne
+            # habituellement par leur fonctionnalité plutôt que par un chemin.
+            # La proposition reste soumise au laboratoire et à autorisation.
+            fonctionnalites = {
+                "voix": "voix.py",
+                "audio": "voix.py",
+                "interface": "gui.py",
+                "gui": "gui.py",
+                "mémoire": "memory_manager.py",
+                "memoire": "memory_manager.py",
+                "base de données": "database.py",
+                "database": "database.py",
+                "agent": "core/agent_core.py",
+                "outils": "tools/tool_registry.py",
+            }
+            message_lower = message.lower()
+            for nom, chemin in fonctionnalites.items():
+                if nom in message_lower:
+                    fichier = chemin
+                    break
 
+        fichiers_lot = plan.get("fichiers") if isinstance(plan, dict) else None
+        if not isinstance(fichiers_lot, list):
+            fichiers_lot = re.findall(
+                r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_./-]+\.py\b",
+                message,
+            )
+        if isinstance(fichiers_lot, list) and len(fichiers_lot) > 1:
+            return self._modifier_lot(message, fichiers_lot)
+
+        if not fichier:
+            analyse = self._orchestrateur.analyser_et_proposer(
+                objectif=message,
+                utiliser_llm=False,
+            )
+            details = getattr(analyse, "details", {}) or {}
+            groupes = details.get("groupes", [])
+            resume = "\n".join(
+                f"• {g.get('type', 'problème')} ({g.get('gravite', 'inconnue')})"
+                for g in groupes[:5] if isinstance(g, dict)
+            ) or "Aucun problème statique prioritaire détecté."
             return ReponseAgent(
-                "Quel fichier dois-je analyser ?",
-                0.6,
+                "Diagnostic préparé sans modifier le projet. Indique le fichier "
+                "à modifier pour générer une proposition contrôlée.\n" + resume,
+                0.8,
                 "MODIFIER_FICHIER",
+                bool(getattr(analyse, "ok", False)),
+                {"analyse": details, "ecriture": False},
             )
 
         fichier = str(fichier).strip()
@@ -1390,6 +1560,22 @@ class AgentCore:
                     demande=message,
                 )
             )
+
+            # Une demande explicite de l'utilisateur peut terminer son cycle
+            # automatiquement lorsque le niveau d'auto-réparation l'autorise.
+            # workflow() conserve le laboratoire, la validation, l'analyse de
+            # risque, le backup et le rollback de l'orchestrateur.
+            details = getattr(resultat, "details", {}) or {}
+            proposition_id = details.get("proposition_id")
+
+            if (
+                getattr(resultat, "ok", False)
+                and proposition_id
+                and getattr(config, "AUTO_REPAIR_LEVEL", 0) >= 5
+            ):
+                resultat = self._orchestrateur.workflow(
+                    str(proposition_id)
+                )
 
             return ReponseAgent(
                 str(
@@ -1427,6 +1613,34 @@ class AgentCore:
                 "MODIFIER_FICHIER",
                 False,
             )
+
+    def _modifier_lot(
+        self,
+        message: str,
+        fichiers: list[Any],
+    ) -> ReponseAgent:
+        """Prépare puis applique un lot multi-fichiers éligible."""
+        cibles = [str(fichier).strip() for fichier in fichiers if str(fichier).strip()]
+        if not cibles or not all(
+            securite.valider_securite_fichier(fichier, modification=True)
+            for fichier in cibles
+        ):
+            return ReponseAgent(
+                "❌ Un fichier du lot est refusé par la politique de sécurité.",
+                0.1, "MODIFIER_FICHIER", False,
+            )
+        try:
+            preparation = self._orchestrateur.preparer_lot_reparation(cibles, message)
+            if not preparation.ok:
+                return ReponseAgent(preparation.message, 0.3, "MODIFIER_FICHIER", False, preparation.details)
+            ids = preparation.details.get("proposition_ids", [])
+            if getattr(config, "AUTO_REPAIR_LEVEL", 0) >= 5:
+                resultat = self._orchestrateur.appliquer_lot(ids)
+                return ReponseAgent(resultat.message, 0.85, "MODIFIER_FICHIER", resultat.ok, resultat.details)
+            return ReponseAgent(preparation.message, 0.85, "MODIFIER_FICHIER", True, preparation.details)
+        except Exception as exc:
+            logger.exception("Préparation lot impossible")
+            return ReponseAgent(f"❌ Préparation du lot impossible : {exc}", 0.2, "MODIFIER_FICHIER", False)
 
     # ========================================================
     # CRÉATION OUTIL
@@ -1538,417 +1752,4 @@ class AgentCore:
     def _executer(
         self,
         message: str,
-        plan: Optional[dict] = None,
-    ) -> ReponseAgent:
-
-        nom = None
-        arguments: Dict[str, Any] = {}
-
-        if isinstance(plan, dict):
-
-            nom = plan.get(
-                "nom_outil"
-            )
-
-            valeur = plan.get(
-                "arguments",
-                {},
-            )
-
-            if isinstance(
-                valeur,
-                dict,
-            ):
-                arguments = valeur
-
-        if not nom:
-
-            match = re.search(
-                r"(?:outil|tool)\s+"
-                r"([a-zA-Z_][a-zA-Z0-9_]*)",
-                message,
-                re.IGNORECASE,
-            )
-
-            if match:
-                nom = match.group(1)
-
-        if not nom:
-
-            return ReponseAgent(
-                "Quel outil dois-je exécuter ?",
-                0.6,
-                "EXECUTER_OUTIL",
-            )
-
-        nom = str(nom).strip()
-
-        outil = self.outils.get(
-            nom
-        )
-
-        if outil is None:
-
-            return ReponseAgent(
-                f"❌ Outil inconnu : {nom}",
-                0.2,
-                "EXECUTER_OUTIL",
-                False,
-            )
-
-        if not re.fullmatch(
-            r"[a-zA-Z_][a-zA-Z0-9_]{0,63}",
-            nom,
-        ):
-            return ReponseAgent(
-                "❌ Nom d'outil invalide.",
-                0.1,
-                "EXECUTER_OUTIL",
-                False,
-            )
-
-        valide, erreur = (
-            self._valider_arguments_outil(
-                outil,
-                arguments,
-            )
-        )
-
-        if not valide:
-
-            return ReponseAgent(
-                f"❌ Arguments invalides : {erreur}",
-                0.1,
-                "EXECUTER_OUTIL",
-                False,
-                {
-                    "outil": nom,
-                    "arguments_valides": False,
-                },
-            )
-
-        try:
-
-            resultat = outil(
-                **arguments
-            )
-
-            logger.info(
-                "Outil exécuté : %s",
-                nom,
-            )
-
-            return ReponseAgent(
-                str(resultat),
-                0.9,
-                "EXECUTER_OUTIL",
-                True,
-                {
-                    "outil": nom,
-                    "arguments_valides": True,
-                },
-            )
-
-        except Exception as exc:
-
-            logger.exception(
-                "Erreur outil %s",
-                nom,
-            )
-
-            return ReponseAgent(
-                f"❌ Erreur outil : {exc}",
-                0.2,
-                "EXECUTER_OUTIL",
-                False,
-            )
-
-    # ========================================================
-    # AUTORISATION
-    # ========================================================
-
-    _DECLENCHEUR_AUTORISATION_RE = re.compile(
-        r"^\s*(?:je\s+)?j?'?(?:autorise|confirme|rejette|refuse)\b[\s:,-]*",
-        re.IGNORECASE,
-    )
-
-    def _extraire_id_proposition(
-        self,
-        message: str,
-    ) -> Optional[str]:
-
-        reste = self._DECLENCHEUR_AUTORISATION_RE.sub(
-            "",
-            message,
-            count=1,
-        )
-
-        match = re.search(
-            r"\b([a-zA-Z0-9][a-zA-Z0-9_-]{3,127})\b",
-            reste,
-        )
-
-        if not match:
-            return None
-
-        return match.group(1)
-
-    def _autoriser(
-        self,
-        message: str,
-    ) -> ReponseAgent:
-
-        if self._orchestrateur is None:
-
-            return ReponseAgent(
-                "❌ Orchestrateur indisponible.",
-                0.2,
-                "CONFIRMATION",
-                False,
-            )
-
-        proposition_id = (
-            self._extraire_id_proposition(
-                message
-            )
-        )
-
-        if not proposition_id:
-
-            return ReponseAgent(
-                "Indique l'identifiant de la proposition.",
-                0.6,
-                "CONFIRMATION",
-            )
-
-        try:
-
-            resultat = (
-                self._orchestrateur.autoriser(
-                    proposition_id
-                )
-            )
-
-            return ReponseAgent(
-                str(
-                    getattr(
-                        resultat,
-                        "message",
-                        resultat,
-                    )
-                ),
-                0.9,
-                "CONFIRMATION",
-                bool(
-                    getattr(
-                        resultat,
-                        "ok",
-                        True,
-                    )
-                ),
-                {
-                    "proposition_id":
-                        proposition_id,
-                },
-            )
-
-        except Exception as exc:
-
-            logger.exception(
-                "Autorisation impossible"
-            )
-
-            return ReponseAgent(
-                f"❌ Autorisation impossible : {exc}",
-                0.2,
-                "CONFIRMATION",
-                False,
-            )
-
-    # ========================================================
-    # REJET
-    # ========================================================
-
-    def _rejeter(
-        self,
-        message: str,
-    ) -> ReponseAgent:
-
-        if self._orchestrateur is None:
-
-            return ReponseAgent(
-                "❌ Orchestrateur indisponible.",
-                0.2,
-                "REJET",
-                False,
-            )
-
-        proposition_id = (
-            self._extraire_id_proposition(
-                message
-            )
-        )
-
-        if not proposition_id:
-
-            return ReponseAgent(
-                "Indique l'identifiant de la proposition.",
-                0.6,
-                "REJET",
-            )
-
-        try:
-
-            resultat = (
-                self._orchestrateur.rejeter(
-                    proposition_id
-                )
-            )
-
-            return ReponseAgent(
-                str(
-                    getattr(
-                        resultat,
-                        "message",
-                        resultat,
-                    )
-                ),
-                0.9,
-                "REJET",
-                bool(
-                    getattr(
-                        resultat,
-                        "ok",
-                        True,
-                    )
-                ),
-                {
-                    "proposition_id":
-                        proposition_id,
-                },
-            )
-
-        except Exception as exc:
-
-            logger.exception(
-                "Rejet impossible"
-            )
-
-            return ReponseAgent(
-                f"❌ Rejet impossible : {exc}",
-                0.2,
-                "REJET",
-                False,
-            )
-
-    # ========================================================
-    # RECHERCHE
-    # ========================================================
-
-    def _rechercher(
-        self,
-        message: str,
-    ) -> ReponseAgent:
-
-        requete = re.sub(
-            r"^(recherche|cherche|"
-            r"cherche sur le web|"
-            r"recherche sur le web|google)\s*",
-            "",
-            message,
-            flags=re.IGNORECASE,
-        ).strip()
-
-        if not requete:
-
-            return ReponseAgent(
-                "Que dois-je rechercher ?",
-                0.6,
-                "RECHERCHE",
-            )
-
-        return ReponseAgent(
-            f"🔎 Recherche demandée : {requete}",
-            0.7,
-            "RECHERCHE",
-            True,
-            {
-                "requete": requete,
-                "executee": False,
-            },
-        )
-
-    # ========================================================
-    # URL
-    # ========================================================
-
-    def _ouvrir_url(
-        self,
-        message: str,
-    ) -> ReponseAgent:
-
-        match = re.search(
-            r"https?://[^\s<>\"']+",
-            message,
-            re.IGNORECASE,
-        )
-
-        if not match:
-
-            return ReponseAgent(
-                "Je n'ai trouvé aucune URL.",
-                0.5,
-                "OUVRIR_URL",
-            )
-
-        url = match.group(0).rstrip(
-            ".,;:!?)]}"
-        )
-
-        return ReponseAgent(
-            f"🌐 URL détectée : {url}",
-            0.9,
-            "OUVRIR_URL",
-            True,
-            {
-                "url": url,
-                "ouverte": False,
-            },
-        )
-
-    # ========================================================
-    # LOG
-    # ========================================================
-
-    def _log(
-        self,
-        niveau: str,
-        message: str,
-        **kwargs: Any,
-    ) -> None:
-
-        niveau = str(
-            niveau
-        ).lower()
-
-        fonction = getattr(
-            logger,
-            niveau,
-            logger.info,
-        )
-
-        fonction(
-            "%s | %s",
-            message,
-            kwargs,
-        )
-
-
-# ============================================================
-# EXPORTS
-# ============================================================
-
-__all__ = [
-    "ReponseAgent",
-    "AgentCore",
-]
+        plan: 

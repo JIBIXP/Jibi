@@ -119,6 +119,9 @@ _PARTIES_IGNOREES = {
     "venv",
     "__pycache__",
     "node_modules",
+    # Le laboratoire contient des copies et des scénarios de test générés.
+    # Il ne fait pas partie du code de production à valider.
+    "jibi_lab",
 }
 
 _MAX_FICHIERS_REPERTOIRE = 5000

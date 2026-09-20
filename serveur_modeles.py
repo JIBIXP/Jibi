@@ -39,6 +39,18 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List
 
+# Reconfiguration encodage UTF-8 pour Windows console
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Query
@@ -54,9 +66,10 @@ try:
         transcrire_audio,
     )
     VOIX_DISPONIBLE = True
-except ImportError as e:
-    print(f"⚠️ Module voix non disponible : {e}")
+except Exception as e:
+    print(f"[VOIX WARNING] Module voix partiellement indisponible : {e}")
     VOIX_DISPONIBLE = False
+    FREQUENCE = 16000
 
 # Logging JIBI (optionnel, repli sur print si absent)
 try:
@@ -65,8 +78,9 @@ try:
 except ImportError:
     LOGGING_DISPONIBLE = False
     def log_event(cat, msg): print(f"[{cat}] {msg}")
-    def log_warning(cat, msg): print(f"[{cat}] ⚠️ {msg}")
-    def log_error(cat, msg, **kw): print(f"[{cat}] ❌ {msg}")
+    def log_warning(cat, msg): print(f"[{cat}] [WARNING] {msg}")
+    def log_error(cat, msg, **kw): print(f"[{cat}] [ERROR] {msg}")
+
 
 # ============================================================
 # CONFIGURATION SERVEUR

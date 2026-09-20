@@ -29,13 +29,14 @@ def analyser_sante_jibi(limite_logs=1000, depuis_heures=24):
         
         return {
             "succes": True,
-            "score_sante": resultats['score_sante'],
-            "etat": resultats['etat'],
-            "erreurs": len(resultats['erreurs']),
-            "warnings": len(resultats['warnings']),
-            "patterns_recurrents": len(resultats['patterns_recurrents']),
-            "logs_analyses": resultats['logs_analyses'],
-            "recommandations": resultats['recommandations']
+            "score_sante": resultats.get("score_sante", 0),
+            "etat": resultats.get("niveau_sante", "Inconnu"),
+            "erreurs": len(resultats.get("erreurs", [])),
+            "warnings": resultats.get("nombre_warnings", 0),
+            "patterns_recurrents": len(resultats.get("patterns_recurrents", [])),
+            "logs_analyses": resultats.get("logs_lignes", 0),
+            "erreurs_critiques": resultats.get("erreurs_critiques", []),
+            "duree": resultats.get("duree", 0),
         }
         
     except Exception as e:
@@ -103,13 +104,15 @@ def preparer_amelioration(
             priorite=priorite
         )
         
+        details = resultats.get("details", {})
+        proposition = details.get("proposition", {}) if isinstance(details, dict) else {}
         return {
-            "succes": True,
-            "proposition_id": resultats['proposition']['id'],
-            "pret_pour_application": resultats['pret_pour_application'],
-            "raisons_blocage": resultats.get('raisons_blocage', []),
-            "validation": resultats.get('validation', {}),
-            "tests": resultats.get('tests', {}),
+            "succes": bool(resultats.get("ok", False)),
+            "proposition_id": proposition.get("id"),
+            "pret_pour_application": False,
+            "raisons_blocage": [] if resultats.get("ok") else [resultats.get("message", "")],
+            "validation": details.get("validation", {}) if isinstance(details, dict) else {},
+            "tests": {},
             "message": (
                 "Amélioration prête pour validation humaine"
                 if resultats['pret_pour_application']

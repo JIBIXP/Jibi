@@ -301,10 +301,9 @@ class RoundedButton(tk.Button):
             "relief": "flat",
             "bd": 0,
             "highlightthickness": 0,
-            "cursor": "hand2",
-            "font": theme.sans(9, bold=True),
-            "padx": 12,
-            "pady": 7,
+            "font": theme.sans(10, bold=True),
+            "padx": 16,
+            "pady": 10,
         }
 
         if width is not None:
@@ -366,9 +365,9 @@ class PillButton(tk.Button):
             "relief": "flat",
             "bd": 0,
             "highlightthickness": 0,
-            "cursor": "hand2",
-            "font": theme.sans(9, bold=True),
-            "padx": 14,
+            "font": theme.sans(10, bold=True),
+            "padx": 18,
+            "pady": 8,
         }
 
         options.update(kwargs)

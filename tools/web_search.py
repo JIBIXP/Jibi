@@ -79,6 +79,80 @@ def _duckduckgo(requete: str, max_resultats: int, type_contenu: str) -> list:
     return resultats
 
 
+def _duckduckgo_api(requete: str, max_resultats: int, type_contenu: str) -> list:
+    if type_contenu == "videos":
+        return []
+    try:
+        r = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": requete, "format": "json", "no_html": "1", "skip_disambig": "1"},
+            headers=UA,
+            timeout=TIMEOUT,
+        )
+        if r.status_code not in (200, 202):
+            return []
+        data = r.json()
+        resultats = []
+        abstract = (data.get("AbstractText") or "").strip()
+        if abstract:
+            resultats.append({
+                "titre": data.get("Heading") or requete,
+                "url": data.get("AbstractURL") or f"https://duckduckgo.com/?q={requete}",
+                "extrait": abstract[:400],
+                "source": "duckduckgo_api",
+            })
+        for topic in data.get("RelatedTopics", []):
+            if isinstance(topic, dict) and topic.get("Text") and topic.get("FirstURL"):
+                resultats.append({
+                    "titre": (topic.get("Text", "")[:60] + "...") if len(topic.get("Text", "")) > 60 else topic.get("Text", ""),
+                    "url": topic.get("FirstURL", ""),
+                    "extrait": topic.get("Text", "")[:300],
+                    "source": "duckduckgo_api",
+                })
+                if len(resultats) >= max_resultats:
+                    break
+        return resultats
+    except Exception:
+        return []
+
+
+def _wikipedia(requete: str, max_resultats: int, type_contenu: str) -> list:
+    if type_contenu == "videos":
+        return []
+    try:
+        r = requests.get(
+            "https://fr.wikipedia.org/w/api.php",
+            params={
+                "action": "opensearch",
+                "search": requete,
+                "limit": max_resultats,
+                "namespace": "0",
+                "format": "json",
+            },
+            headers=UA,
+            timeout=TIMEOUT,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        if not isinstance(data, list) or len(data) < 4:
+            return []
+        titres, descriptions, urls = data[1], data[2], data[3]
+        resultats = []
+        for i in range(min(len(titres), max_resultats)):
+            desc = descriptions[i] if i < len(descriptions) and descriptions[i] else f"Article Wikipédia sur {titres[i]}"
+            url = urls[i] if i < len(urls) else f"https://fr.wikipedia.org/wiki/{titres[i]}"
+            resultats.append({
+                "titre": titres[i],
+                "url": url,
+                "extrait": desc[:300],
+                "source": "wikipedia",
+            })
+        return resultats
+    except Exception:
+        return []
+
+
 # ============================================================
 # API PUBLIQUE
 # ============================================================
@@ -102,7 +176,13 @@ def rechercher(requete: str, max_resultats: int = 8, type_contenu: str = "web") 
     type_contenu = "videos" if str(type_contenu).lower().startswith("vid") else "web"
 
     erreurs = []
-    for nom, moteur in (("tavily", _tavily), ("duckduckgo", _duckduckgo)):
+    moteurs = (
+        ("tavily", _tavily),
+        ("duckduckgo", _duckduckgo),
+        ("duckduckgo_api", _duckduckgo_api),
+        ("wikipedia", _wikipedia),
+    )
+    for nom, moteur in moteurs:
         try:
             res = moteur(requete, max_resultats, type_contenu)
             if res:

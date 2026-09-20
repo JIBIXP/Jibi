@@ -50,6 +50,10 @@ def _obtenir_orchestrateur() -> Any:
     if classe is not None:
         return classe()
 
+    factory = getattr(orchestrateur, "creer_orchestrateur", None)
+    if callable(factory):
+        return factory(depot=DEPOT_DIR)
+
     return orchestrateur
 
 
@@ -57,13 +61,22 @@ def _obtenir_orchestrateur() -> Any:
 # ANALYSE
 # ---------------------------------------------------------------------------
 
-def analyser_jibi() -> dict:
+def analyser_jibi(
+    limite_logs: int | None = None,
+    depuis_heures: float | None = None,
+    **_: Any,
+) -> dict:
     """
     Compatibilité historique.
 
     L'analyse reste descriptive.
     """
-    return analyseur.analyser_logs()
+    kwargs: dict[str, Any] = {}
+    if limite_logs is not None:
+        kwargs["limite"] = limite_logs
+    if depuis_heures is not None:
+        kwargs["depuis_heures"] = depuis_heures
+    return analyseur.analyser_logs(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -72,12 +85,15 @@ def analyser_jibi() -> dict:
 
 def preparer_amelioration(
     fichier: str,
-    probleme: str,
-    ancien: str,
-    nouveau: str,
+    probleme: str = "",
+    ancien: str = "",
+    nouveau: str = "",
     *,
     origine: str = "agent",
     priorite: str = "moyenne",
+    solution: str = "",
+    justification: str = "",
+    demande: str = "",
 ) -> dict:
     """
     Prépare une proposition de réparation.
@@ -104,15 +120,18 @@ def preparer_amelioration(
             ),
         }
 
+    demande_finale = demande.strip() or "\n".join(
+        element for element in (
+            probleme.strip(), solution.strip(), justification.strip(),
+            f"Ancien comportement : {ancien.strip()}" if ancien.strip() else "",
+            f"Nouveau comportement attendu : {nouveau.strip()}" if nouveau.strip() else "",
+        ) if element
+    )
+    if not demande_finale:
+        return {"ok": False, "succes": False, "message": "Décris l'amélioration demandée."}
+
     try:
-        resultat = fonction(
-            fichier=fichier,
-            probleme=probleme,
-            ancien=ancien,
-            nouveau=nouveau,
-            origine=origine,
-            priorite=priorite,
-        )
+        resultat = fonction(fichier=fichier, demande=demande_finale)
 
     except TypeError:
         # Compatibilité avec une signature plus ancienne.
@@ -140,6 +159,13 @@ def preparer_amelioration(
             "type_erreur": type(exc).__name__,
         }
 
+    if hasattr(resultat, "to_dict"):
+        resultat = resultat.to_dict()
+    if not isinstance(resultat, dict):
+        return {"ok": False, "succes": False, "message": "Réponse d'orchestrateur invalide."}
+    resultat.setdefault("succes", bool(resultat.get("ok", False)))
+    resultat.setdefault("origine", origine)
+    resultat.setdefault("priorite", priorite)
     return resultat
 
 
@@ -340,10 +366,22 @@ def appliquer_amelioration(
         }
 
     try:
-        return fonction(
-            proposition_id,
-            confirmation,
-        )
+        # L'orchestrateur actuel vérifie l'autorisation persistée et ne prend
+        # que l'identifiant. Certaines anciennes implémentations acceptaient
+        # aussi la confirmation : ne l'utiliser qu'en solution de repli.
+        return fonction(proposition_id)
+
+    except TypeError:
+        try:
+            return fonction(proposition_id, confirmation)
+
+        except Exception as exc:
+            return {
+                "ok": False,
+                "succes": False,
+                "message": str(exc),
+                "type_erreur": type(exc).__name__,
+            }
 
     except Exception as exc:
         return {

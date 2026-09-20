@@ -429,6 +429,11 @@ class JibiGUI:
             self._refresh_model_status,
         )
 
+        self.root.after(
+            400,
+            self.refresh_props,
+        )
+
         self.root.protocol(
             "WM_DELETE_WINDOW",
             self._on_close,
@@ -518,6 +523,8 @@ class JibiGUI:
             side="left",
             fill="both",
             expand=True,
+            padx=20,
+            pady=(0, 20),
         )
 
         self.center.grid_rowconfigure(
@@ -542,10 +549,22 @@ class JibiGUI:
         )
 
         # ------------------------------------------------------------------
-        # Propositions
+        # FIX BUG 1 : proposals_view était jamais créé
         # ------------------------------------------------------------------
 
         self.proposals_view = self._build_proposals_view(
+            self.center
+        )
+
+        # ------------------------------------------------------------------
+        # Vues secondaires (Tools & Diagnostics)
+        # ------------------------------------------------------------------
+
+        self.tools_view = self._build_tools_view(
+            self.center
+        )
+
+        self.diag_view = self._build_diag_view(
             self.center
         )
 
@@ -618,31 +637,25 @@ class JibiGUI:
             padx=(10, 6),
         )
 
-        badge = RoundedFrame(
+        # Badge AURORA amélioré avec bordure lumineuse
+        badge_frame = tk.Frame(
             left,
-            radius=8,
-            card_bg=theme.ACCENT_SOFT,
-            bg=theme.BG,
-            pad=0,
+            bg=theme.ACCENT,
+            padx=1,
+            pady=1,
         )
+        badge_frame.pack(side="left", padx=10)
 
-        badge.pack(
-            side="left"
-        )
-
-        tk.Label(
-            badge.body,
-            text="AURORA",
+        badge = tk.Label(
+            badge_frame,
+            text=" AURORA ",
             bg=theme.ACCENT_SOFT,
             fg=theme.ACCENT,
-            font=theme.sans(
-                8,
-                bold=True,
-            ),
-        ).pack(
+            font=theme.sans(10, bold=True),
             padx=8,
             pady=3,
         )
+        badge.pack()
 
         right = tk.Frame(
             top,
@@ -722,7 +735,7 @@ class JibiGUI:
         )
 
         # ------------------------------------------------------------------
-        # Liste
+        # Liste (panneau gauche)
         # ------------------------------------------------------------------
 
         left = tk.Frame(
@@ -739,8 +752,12 @@ class JibiGUI:
 
         left.grid_propagate(False)
 
+        # En-tête panneau gauche avec bouton "Lancer l'analyse"
+        props_head = tk.Frame(left, bg=theme.PANEL)
+        props_head.pack(fill="x", padx=theme.SPACE_MD, pady=(theme.SPACE_LG, theme.SPACE_SM))
+
         tk.Label(
-            left,
+            props_head,
             text="PROPOSITIONS",
             bg=theme.PANEL,
             fg=theme.TEXT_FAINT,
@@ -749,13 +766,18 @@ class JibiGUI:
                 bold=True,
             ),
         ).pack(
+            side="left",
             anchor="w",
-            padx=theme.SPACE_MD,
-            pady=(
-                theme.SPACE_LG,
-                theme.SPACE_SM,
-            ),
         )
+
+        PillButton(
+            props_head,
+            text="Analyser",
+            icon="flask",
+            kind="soft",
+            height=26,
+            command=self._lancer_analyse,
+        ).pack(side="right")
 
         self.props_area = ScrollArea(
             left,
@@ -938,47 +960,152 @@ class JibiGUI:
 
         return view
 
+    def _build_tools_view(self, master):
+        view = tk.Frame(master, bg=theme.BG)
+        view.grid_rowconfigure(1, weight=1)
+        view.grid_columnconfigure(0, weight=1)
+
+        head = tk.Frame(view, bg=theme.BG)
+        head.grid(row=0, column=0, sticky="ew", padx=theme.SPACE_LG, pady=theme.SPACE_MD)
+        tk.Label(head, text="🛠️ Catalogue des Outils (Tools)", bg=theme.BG, fg=theme.TEXT, font=theme.serif(15, bold=True)).pack(side="left")
+
+        wrap = tk.Frame(view, bg=theme.PANEL)
+        wrap.grid(row=1, column=0, sticky="nsew", padx=theme.SPACE_LG, pady=(0, theme.SPACE_LG))
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+
+        scrollbar = ThinScrollbar(wrap, bg=theme.PANEL)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        canvas = tk.Canvas(wrap, bg=theme.PANEL, bd=0, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.attach(canvas)
+
+        self._tools_container = tk.Frame(canvas, bg=theme.PANEL)
+        canvas.create_window((0, 0), window=self._tools_container, anchor="nw")
+
+        def _on_frame_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        self._tools_container.bind("<Configure>", _on_frame_configure)
+
+        # FIX BUG 6 : Bind scroll dans la vue Tools
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        self._tools_container.bind("<MouseWheel>", _on_mousewheel)
+        self._tools_canvas = canvas
+
+        return view
+
+    def _refresh_tools_view(self):
+        if not hasattr(self, "_tools_container"):
+            return
+        for w in self._tools_container.winfo_children():
+            w.destroy()
+
+        try:
+            from tools.tool_registry import obtenir_catalogue_outils
+            catalogue = obtenir_catalogue_outils()
+        except Exception:
+            catalogue = []
+
+        for tool in catalogue:
+            card = RoundedFrame(self._tools_container, radius=8, card_bg=theme.ELEVATED, bg=theme.PANEL, pad=10)
+            card.pack(fill="x", padx=12, pady=6)
+            
+            lbl_head = tk.Label(card.body, text=f"• {tool['nom']}", bg=theme.ELEVATED, fg=theme.ACCENT, font=theme.sans(11, bold=True), anchor="w")
+            lbl_head.pack(fill="x")
+            
+            lbl_desc = tk.Label(card.body, text=tool['description'], bg=theme.ELEVATED, fg=theme.TEXT_SUB, font=theme.sans(9), anchor="w", justify="left")
+            lbl_desc.pack(fill="x", pady=(2, 0))
+
+    def _build_diag_view(self, master):
+        view = tk.Frame(master, bg=theme.BG)
+        view.grid_rowconfigure(1, weight=1)
+        view.grid_columnconfigure(0, weight=1)
+
+        head = tk.Frame(view, bg=theme.BG)
+        head.grid(row=0, column=0, sticky="ew", padx=theme.SPACE_LG, pady=theme.SPACE_MD)
+        tk.Label(head, text="📊 Diagnostics & Statut Système", bg=theme.BG, fg=theme.TEXT, font=theme.serif(15, bold=True)).pack(side="left")
+
+        wrap = tk.Frame(view, bg=theme.PANEL)
+        wrap.grid(row=1, column=0, sticky="nsew", padx=theme.SPACE_LG, pady=(0, theme.SPACE_LG))
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+
+        self.diag_text = tk.Text(wrap, wrap="word", bg=theme.PANEL, fg=theme.TEXT, font=theme.mono(10), bd=0, padx=14, pady=14, state="disabled")
+        self.diag_text.grid(row=0, column=0, sticky="nsew")
+
+        return view
+
+    def _refresh_diag_view(self):
+        if not hasattr(self, "diag_text"):
+            return
+        import psutil, platform
+        cpu = psutil.cpu_percent()
+        ram = psutil.virtual_memory().percent
+        
+        diag_info = [
+            "==================================================",
+            "📊 DIAGNOSTIC SYSTÈME JIBI v12.5",
+            "==================================================",
+            f"• OS             : {platform.system()} {platform.release()}",
+            f"• Python         : {platform.python_version()}",
+            f"• Utilisation CPU: {cpu}%",
+            f"• Utilisation RAM: {ram}%",
+            f"• Core Agent     : {'✅ Chargé' if CORE_IMPORT_ERROR is None else '❌ Erreur'}",
+            f"• Auto-Amélioration: {'✅ Active' if EVOLUTION_IMPORT_ERROR is None else '⚠️ Non chargée'}",
+            f"• Serveur Modèles: http://127.0.0.1:8765",
+            "==================================================",
+        ]
+        
+        self.diag_text.config(state="normal")
+        self.diag_text.delete("1.0", "end")
+        self.diag_text.insert("1.0", "\n".join(diag_info))
+        self.diag_text.config(state="disabled")
+
     # ======================================================================
     # NAVIGATION
     # ======================================================================
 
     def show_view(self, name: str):
-        if name not in {"chat", "proposals"}:
+        if name not in {"chat", "proposals", "tools", "diag"}:
             name = "chat"
 
         self._active_view = name
 
-        if name == "chat":
+        # Cacher toutes les vues
+        self.chat_view.grid_forget()
+        self.input_bar.grid_forget()
+        if hasattr(self, "proposals_view"):
             self.proposals_view.grid_forget()
+        if hasattr(self, "tools_view"):
+            self.tools_view.grid_forget()
+        if hasattr(self, "diag_view"):
+            self.diag_view.grid_forget()
 
-            self.chat_view.grid(
-                row=0,
-                column=0,
-                sticky="nsew",
-            )
+        if name == "chat":
+            self.chat_view.grid(row=0, column=0, sticky="nsew")
+            self.input_bar.grid(row=1, column=0, sticky="ew")
 
-            self.input_bar.grid(
-                row=1,
-                column=0,
-                sticky="ew",
-            )
+        elif name == "proposals":
+            if hasattr(self, "proposals_view"):
+                self.proposals_view.grid(row=0, column=0, rowspan=2, sticky="nsew")
+                self.refresh_props()
 
-        else:
-            self.chat_view.grid_forget()
-            self.input_bar.grid_forget()
+        elif name == "tools":
+            if hasattr(self, "tools_view"):
+                self.tools_view.grid(row=0, column=0, rowspan=2, sticky="nsew")
+                self._refresh_tools_view()
 
-            self.proposals_view.grid(
-                row=0,
-                column=0,
-                rowspan=2,
-                sticky="nsew",
-            )
+        elif name == "diag":
+            if hasattr(self, "diag_view"):
+                self.diag_view.grid(row=0, column=0, rowspan=2, sticky="nsew")
+                self._refresh_diag_view()
 
-            self.refresh_props()
+        self.sidebar.set_active_nav(name)
 
-        self.sidebar.set_active_nav(
-            name
-        )
 
     def _toggle_sidebar(self):
         self.sidebar.toggle()
@@ -1356,7 +1483,7 @@ class JibiGUI:
                 ):
                     return
 
-                if self.etat != "busy":
+                if self._current_bot_row is None:
                     self.set_status(
                         "busy"
                     )
@@ -1502,10 +1629,15 @@ class JibiGUI:
 
         self.busy = False
         self.cancel_ev = None
+        self._current_bot_row = None
+        self._stream_buf = ""
 
         self.input_bar.set_busy(
             False
         )
+
+        if self.etat != "confirmation":
+            self.set_status("ready")
 
         self.input_bar.focus_input()
 
@@ -1736,8 +1868,88 @@ class JibiGUI:
         self.input_bar.focus_input()
 
     # ======================================================================
-    # PROPOSITIONS
+    # PROPOSITIONS + AUTO-AMÉLIORATION
     # ======================================================================
+
+    def _lancer_analyse(self):
+        """Lance une analyse automatique du projet et génère des propositions."""
+        if self.busy or self._closing:
+            return
+
+        if not EV_OK or evolution is None:
+            self.chat_view.add_bot(
+                "⚠️ Module self_improvement indisponible. "
+                "Impossible de lancer l'analyse.",
+                meta=datetime.now().strftime("%H:%M"),
+            )
+            self.show_view("chat")
+            return
+
+        # Lance l'analyse via AgentCore / orchestrateur
+        self.busy = True
+        self.set_status("thinking")
+
+        def worker():
+            try:
+                # Utilise l'orchestrateur pour une analyse statique et diagnostique
+                orch = getattr(self.agent, "_orchestrateur", None)
+                if orch is not None:
+                    resultat_diag = orch.diagnostiquer()
+                    resultat_stat = orch.analyser_et_proposer(utiliser_llm=False)
+                    groupes = (getattr(resultat_stat, "details", {}) or {}).get("groupes", [])
+                    res_pistes = "\n".join(
+                        f"• {g.get('type', 'problème')} ({g.get('gravite', 'inconnue')}, {g.get('nombre', 0)} occurrence(s))"
+                        for g in groupes[:4] if isinstance(g, dict)
+                    ) or "Aucune anomalie critique."
+                    texte = (
+                        f"🔍 Analyse du projet terminée avec succès.\n\n"
+                        f"📊 Diagnostic santé : {getattr(resultat_diag, 'message', 'Effectué')}\n\n"
+                        f"Pistes d'amélioration détectées :\n{res_pistes}\n\n"
+                        "Consultez les propositions ci-contre pour inspecter les diffs et les autoriser."
+                    )
+                else:
+                    # Fallback : utilise le gestionnaire
+                    from self_improvement import gestionnaire
+                    gestionnaire.analyser_jibi()
+                    texte = (
+                        "🔍 Analyse de JIBI terminée.\n\n"
+                        "Consultez la vue Auto-Amélioration pour voir les propositions."
+                    )
+                self.q.put((self.req_id, "analyse_ok", texte))
+            except Exception as exc:
+                self.q.put((self.req_id, "analyse_err", str(exc)))
+
+        self.req_id += 1
+        threading.Thread(target=worker, daemon=True).start()
+
+        self.root.after(100, self._poll_analyse)
+
+    def _poll_analyse(self):
+        if self._closing:
+            return
+        try:
+            while True:
+                rid, kind, payload = self.q.get_nowait()
+                break
+        except Empty:
+            if self.busy and not self._closing:
+                self.root.after(100, self._poll_analyse)
+            return
+
+        self.busy = False
+        self.set_status("ready")
+
+        if kind in ("analyse_ok", "analyse_err"):
+            if kind == "analyse_err":
+                payload = f"❌ Erreur lors de l'analyse : {payload}"
+            self.chat_view.add_bot(
+                payload,
+                meta=datetime.now().strftime("%H:%M"),
+            )
+            # Rafraîchir les propositions sans forcer le retour au chat si on est dans proposals
+            self.refresh_props()
+            if self._active_view != "proposals":
+                self.show_view("chat")
 
     def refresh_props(self):
         if self._closing:
@@ -1769,11 +1981,14 @@ class JibiGUI:
             return
 
         try:
-            propositions = (
-                evolution.lister("en_attente")
-                + evolution.lister("tests_echoues")
-            )
-
+            # Récupère toutes les propositions du registre d'évolution
+            toutes = evolution.lister()
+            # Priorité aux propositions en attente de révision/autorisation
+            en_cours = [
+                p for p in toutes
+                if p.get("statut") in ("proposition", "en_attente", "prete", "tests_echoues", "validee")
+            ]
+            propositions = en_cours if en_cours else toutes
         except Exception:
             propositions = []
 
@@ -2347,8 +2562,10 @@ class JibiGUI:
             pass
 
         try:
+            # FIX BUG 5 : utiliser l'API positionnelle de UIState.set()
             self.state.set(
-                geometry=self.root.geometry()
+                "geometry",
+                self.root.geometry()
             )
 
             self.state.save()

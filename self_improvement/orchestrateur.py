@@ -644,8 +644,8 @@ class OrchestrateurEvolution:
     def _collecter_unites_code(
         self,
         contenu: str,
-        max_unites: int = 8,
-        max_lignes: int = 60,
+        max_unites: int | None = 8,
+        max_lignes: int = 220,
     ) -> list[dict[str, Any]]:
         """
         Extrait de petites unités Python réellement remplaçables.
@@ -726,7 +726,7 @@ class OrchestrateurEvolution:
             )
         )
 
-        return unites[:max_unites]
+        return unites[:max_unites] if max_unites is not None else unites
 
     def _normaliser_cible_demandee(
         self,
@@ -876,8 +876,14 @@ class OrchestrateurEvolution:
         contenu_actuel = self._lire(chemin)
         contexte = contexte or {}
 
-        unites = self._collecter_unites_code(contenu_actuel)
         cible_demandee = self._normaliser_cible_demandee(contexte)
+        # Collecte complète avant filtrage : une cible nommée ne doit jamais
+        # disparaître parce qu'elle n'est pas parmi les fonctions les plus
+        # courtes du fichier.
+        unites = self._collecter_unites_code(
+            contenu_actuel,
+            max_unites=None,
+        )
 
         if cible_demandee:
             exactes = [
@@ -888,6 +894,24 @@ class OrchestrateurEvolution:
             ]
             if exactes:
                 unites = exactes[:1]
+
+        # Sans symbole explicite, un petit ensemble réduit le bruit et évite
+        # de dépasser le contexte du modèle. Les propositions automatiques
+        # restent donc limitées à des modifications courtes et contrôlables.
+        if not cible_demandee:
+            mots_objectif = {
+                mot.lower()
+                for mot in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", objectif)
+                if len(mot) > 2
+            }
+            unites.sort(
+                key=lambda unite: (
+                    0 if unite["nom"].lower() in mots_objectif else 1,
+                    unite["nombre_lignes"],
+                    unite["ligne_debut"],
+                )
+            )
+            unites = unites[:4]
 
         if not unites:
             raise RuntimeError(
@@ -958,7 +982,8 @@ Règles :
             resultat = fonction_json(
                 prompt,
                 system=system_patch,
-                profil="CODE",
+                profil="PATCH",
+                temperature=0.0,
             )
         else:
             fonction = getattr(
@@ -972,9 +997,9 @@ Règles :
                 )
 
             brut = fonction(
-                prompt,
-                system=system_patch,
-                profil="CODE",
+                    prompt,
+                    system=system_patch,
+                    profil="PATCH",
                 temperature=0.0,
                 json_mode=True,
             )
@@ -2206,7 +2231,7 @@ La valeur de cible doit être exactement l'un des ids fournis.
         self,
         objectif: str = "Améliorer la qualité du code",
         utiliser_llm: bool = True,
-        auto_appliquer: bool = False,
+        auto_appliquer: bool | None = None,
     ) -> ResultatOrchestration:
         """
         Exécute le cycle complet :
@@ -2219,6 +2244,15 @@ La valeur de cible doit être exactement l'un des ids fournis.
         → autorisation
         → application éventuelle
         """
+
+        # Sans choix explicite de l'appelant, le niveau global pilote le
+        # comportement. Le niveau 5 n'autorise que les correctifs déclarés
+        # auto-applicables par le moteur de risque.
+        if auto_appliquer is None:
+            auto_appliquer = bool(
+                config is not None
+                and getattr(config, "AUTO_REPAIR_LEVEL", 0) >= 5
+            )
 
         # ---------------------------------------------------------------
         # PHASE 1
@@ -2770,6 +2804,35 @@ La valeur de cible doit être exactement l'un des ids fournis.
     # ========================================================================
     # PROPOSITIONS
     # ========================================================================
+
+    def preparer_lot_reparation(
+        self,
+        fichiers: list[str],
+        demande: str,
+    ) -> ResultatOrchestration:
+        """Prépare une proposition indépendante pour chaque fichier d'un lot."""
+        cibles = list(dict.fromkeys(str(fichier).strip() for fichier in fichiers))
+        cibles = [fichier for fichier in cibles if fichier]
+        if not cibles:
+            return ResultatOrchestration(False, "lot", "Aucun fichier cible.")
+
+        propositions_lot: list[str] = []
+        for fichier in cibles:
+            resultat = self.preparer_reparation(fichier, demande)
+            if not resultat.ok:
+                return ResultatOrchestration(
+                    False, "lot", resultat.message,
+                    {"fichier": fichier, "propositions": propositions_lot},
+                )
+            proposition_id = resultat.details.get("proposition_id")
+            if not proposition_id:
+                return ResultatOrchestration(False, "lot", "Proposition sans identifiant.")
+            propositions_lot.append(str(proposition_id))
+
+        return ResultatOrchestration(
+            True, "lot", "Propositions du lot préparées.",
+            {"fichiers": cibles, "proposition_ids": propositions_lot},
+        )
 
     def _charger_proposition(
         self,
@@ -4069,6 +4132,72 @@ La valeur de cible doit être exactement l'un des ids fournis.
                 ),
                 "marquage": statut_resultat,
             },
+        )
+
+    # ========================================================================
+    # APPLICATION TRANSACTIONNELLE D'UN LOT
+    # ========================================================================
+
+    def appliquer_lot(
+        self,
+        proposition_ids: list[str],
+    ) -> ResultatOrchestration:
+        """Applique un ensemble de propositions avec rollback global.
+
+        Chaque proposition passe le laboratoire, la validation et le risque
+        avant la première écriture. Si l'une des applications échoue, les
+        fichiers déjà modifiés sont restaurés depuis leurs backups.
+        """
+        ids = list(dict.fromkeys(str(pid).strip() for pid in proposition_ids))
+        ids = [pid for pid in ids if pid]
+        if not ids:
+            return ResultatOrchestration(False, "lot", "Aucune proposition fournie.")
+
+        preflight: list[str] = []
+        for proposition_id in ids:
+            labo = self.tester_en_labo(proposition_id)
+            if not labo.ok:
+                return ResultatOrchestration(False, "lot", labo.message, {"proposition_id": proposition_id})
+            validation = self.valider(proposition_id)
+            if not validation.ok:
+                return ResultatOrchestration(False, "lot", validation.message, {"proposition_id": proposition_id})
+            risque = self.evaluer_risque(proposition_id)
+            donnees_risque = risque.details.get("risque", {}) if risque.ok else {}
+            if not risque.ok or not donnees_risque.get("auto_applicable", False):
+                return ResultatOrchestration(
+                    False, "lot", "Une proposition du lot n'est pas auto-applicable.",
+                    {"proposition_id": proposition_id, "risque": donnees_risque},
+                )
+            preflight.append(proposition_id)
+
+        applications: list[dict[str, Any]] = []
+        for proposition_id in preflight:
+            resultat = self.appliquer_auto(proposition_id)
+            if resultat.ok:
+                applications.append(resultat.details)
+                continue
+
+            restaurations = []
+            for details in reversed(applications):
+                backup = details.get("backup") if isinstance(details, dict) else None
+                restaurations.append(self._restaurer_backup(backup))
+            return ResultatOrchestration(
+                False,
+                "rollback_lot",
+                "Échec d'un patch : le lot a été restauré.",
+                {
+                    "proposition_id": proposition_id,
+                    "erreur": resultat.message,
+                    "restaurations": restaurations,
+                    "appliquees_avant_echec": applications,
+                },
+            )
+
+        return ResultatOrchestration(
+            True,
+            "lot",
+            "Lot appliqué avec succès.",
+            {"propositions": preflight, "applications": applications},
         )
 
     # ========================================================================

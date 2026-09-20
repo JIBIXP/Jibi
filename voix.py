@@ -21,7 +21,8 @@ TTS_RATE = int(os.getenv("TTS_RATE", "150"))  # Vitesse parole (mots/min)
 TTS_VOLUME = float(os.getenv("TTS_VOLUME", "0.9"))  # Volume (0.0-1.0)
 TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", "fr-FR")
 
-# STT (Speech-To-Text)
+# STT (Speech-To-Text) & Audio Params
+FREQUENCE = 16000  # Fréquence d'échantillonnage audio standard (16kHz)
 STT_ENGINE = os.getenv("STT_ENGINE", "google")  # google, whisper, sphinx
 STT_ACTIVE = os.getenv("STT_ACTIVE", "0") == "1"
 STT_LANGUAGE = os.getenv("STT_LANGUAGE", "fr-FR")
@@ -736,7 +737,107 @@ def tester_voix():
     return rapport
 
 
-def nettoyer_ressources_voix():
+# ============================================================
+# COMPATIBILITÉ & FONCTIONS EXPORTÉES POUR SERVEUR ET ECOUTE
+# ============================================================
+
+def get_modele_parakeet():
+    """Retourne l'état ou l'instance du modèle STT (Parakeet/Whisper)."""
+    return {"moteur": STT_ENGINE, "disponible": _speech_recognition_disponible or _whisper_disponible}
+
+
+def generer_audio(texte: str, langue: str = "fr") -> str:
+    """
+    Génère un fichier audio (MP3/WAV) à partir d'un texte et renvoie son chemin.
+    """
+    if not texte or not texte.strip():
+        return ""
+    
+    hash_txt = _obtenir_hash_texte(texte)
+    fichier = CACHE_AUDIO_DIR / f"gen_{hash_txt}.mp3"
+    
+    if fichier.exists():
+        return str(fichier)
+    
+    if _gtts_disponible:
+        try:
+            tts = gTTS(text=texte, lang=langue.split('-')[0], slow=False)
+            tts.save(str(fichier))
+            return str(fichier)
+        except Exception as e:
+            log_warning("voix", f"gTTS échec génération audio: {e}")
+    
+    # Repli sur pyttsx3 si disponible
+    engine = _initialiser_pyttsx3()
+    if engine:
+        try:
+            wav_file = CACHE_AUDIO_DIR / f"gen_{hash_txt}.wav"
+            engine.save_to_file(texte, str(wav_file))
+            engine.runAndWait()
+            return str(wav_file)
+        except Exception as e:
+            log_error("voix", f"pyttsx3 échec sauvegarde fichier audio: {e}")
+            
+    return str(fichier)
+
+
+def transcrire_audio(source_audio) -> str:
+    """
+    Transcrit un fichier audio, des octets WAV ou un tableau numpy en texte.
+    """
+    if source_audio is None:
+        return ""
+    
+    # Si c'est déjà une chaîne correspondant à un fichier
+    if isinstance(source_audio, (str, Path)):
+        p = Path(source_audio)
+        if not p.exists():
+            return ""
+        if _speech_recognition_disponible:
+            try:
+                r = _initialiser_recognizer() or sr.Recognizer()
+                with sr.AudioFile(str(p)) as source:
+                    audio_data = r.record(source)
+                    return r.recognize_google(audio_data, language=STT_LANGUAGE)
+            except Exception as e:
+                log_warning("voix", f"Erreur transcription fichier audio: {e}")
+                return ""
+    
+    # Si des octets WAV sont passés
+    if isinstance(source_audio, bytes):
+        if _speech_recognition_disponible:
+            try:
+                r = _initialiser_recognizer() or sr.Recognizer()
+                import io
+                with sr.AudioFile(io.BytesIO(source_audio)) as source:
+                    audio_data = r.record(source)
+                    return r.recognize_google(audio_data, language=STT_LANGUAGE)
+            except Exception as e:
+                log_warning("voix", f"Erreur transcription octets audio: {e}")
+                return ""
+
+    # Par défaut, tenter d'écouter le micro si rien n'est passé
+    res = ecouter(timeout=5)
+    return res or ""
+
+
+def ecouter_jusqua_silence(timeout: int = 5, phrase_limit: int = 15) -> Optional[bytes]:
+    """
+    Écoute le microphone et renvoie les octets du segment audio capturé.
+    """
+    if not _speech_recognition_disponible:
+        return None
+    
+    try:
+        recognizer = _initialiser_recognizer() or sr.Recognizer()
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_limit)
+            return audio.get_wav_data()
+    except Exception as e:
+        log_warning("voix", f"Erreur ecouter_jusqua_silence: {e}")
+        return None
+
     """Libère toutes ressources voix (à appeler avant fermeture app)."""
     global _tts_thread_active, _tts_engine_pyttsx3
     

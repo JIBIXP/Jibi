@@ -22,7 +22,9 @@ except Exception:
     def log_error(*a, **kw): pass
 
 def test_import_jibi():
-    modules_critiques = ["logging_jibi", "core.agent_core", "core.config", "tools.tool_registry"]
+    # tools.tool_registry contient l'état global. Le recharger seul vide le
+    # registre alors que tools.__init__ ne repasse pas automatiquement dessus.
+    modules_critiques = ["logging_jibi", "core.agent_core", "core.config", "tools"]
     resultats, ok_global = {}, True
     for module_name in modules_critiques:
         try:
@@ -77,18 +79,23 @@ def test_imports_modules():
 
 def test_configuration():
     try:
-        from dotenv import load_dotenv
-        load_dotenv(override=True)
-        manquantes = [var for var in ["JIBI_PROJET_DIR", "OLLAMA_MODEL"] if not os.getenv(var)]
-        if manquantes:
-            return {"ok": False, "message": f"Variables manquantes : {', '.join(manquantes)}"}
-        return {"ok": True, "message": "Configuration valide."}
+        # core.config fournit des valeurs sûres par défaut pour ces options.
+        # Leur absence du .env ne rend donc pas JIBI inutilisable.
+        from core import config
+        projet = getattr(config, "JIBI_PROJET_DIR", None)
+        modele = getattr(config, "MODEL", None)
+        if not projet or not modele:
+            return {"ok": False, "message": "Configuration projet ou modèle indisponible."}
+        return {"ok": True, "message": "Configuration valide (valeurs .env ou repli)."}
     except Exception as e:
         log_error("test_runner", f"Test configuration échoué : {e}", exc_info=False)
         return {"ok": False, "message": str(e)[:200]}
 
 def test_outils_essentiels():
     try:
+        # Le registre est alimenté par tools.__init__, pas par son module de
+        # stockage seul. L'import direct de tool_registry donnait un faux vide.
+        import tools
         from tools.tool_registry import TOOLS_REGISTRY
         outils_essentiels = ["creer_document_word", "creer_document_pdf", "ouvrir_application", "verifier_mise_a_jour"]
         manquants = [o for o in outils_essentiels if o not in TOOLS_REGISTRY]
@@ -100,7 +107,7 @@ def test_outils_essentiels():
         return {"ok": False, "message": str(e)[:200]}
 
 def test_dependances_presentes():
-    dependances_critiques = ["dotenv", "psutil", "docx", "reportlab"]
+    dependances_critiques = ["dotenv", "psutil", "docx", "fpdf"]
     dependances_ok, manquantes = 0, []
     for dep in dependances_critiques:
         try:

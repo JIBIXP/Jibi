@@ -11,9 +11,14 @@ transformers
 torch
 kokoro
 soundfile
+SpeechRecognition
+PyAudio
 edge-tts
 qtawesome
 qt-material
 fastapi
 uvicorn
 python-multipart
+psutil
+python-docx
+fpdf2

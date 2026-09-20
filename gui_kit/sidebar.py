@@ -1,6 +1,9 @@
 """
 JIBI GUI Kit — Sidebar
 ======================
+
+Design premium : barre d'accent latérale pour nav active,
+hover élégant, modèle visible dans le footer.
 """
 
 from __future__ import annotations
@@ -8,7 +11,7 @@ from __future__ import annotations
 import tkinter as tk
 
 from .controls import Divider, IconButton, RoundedButton
-from .theme import COLORS, FONT, LAYOUT
+from .theme import COLORS, FONT, LAYOUT, ACCENT, ACCENT_SOFT, TEXT, TEXT_DIM, TEXT_FAINT, PANEL, ELEVATED, BORDER_SOFT
 
 
 class Sidebar(tk.Frame):
@@ -54,6 +57,7 @@ class Sidebar(tk.Frame):
         self.collapsed = False
         self.is_open = True
         self.sessions = {}
+        self._active_nav = "chat"
 
         # Compatibilité callbacks
         self.on_new = on_new or on_new_chat
@@ -94,8 +98,8 @@ class Sidebar(tk.Frame):
         )
         header.pack(
             fill="x",
-            padx=16,
-            pady=(18, 8),
+            padx=24,
+            pady=(24, 12),
         )
 
         self.title = tk.Label(
@@ -103,7 +107,7 @@ class Sidebar(tk.Frame):
             text="JIBI",
             bg=COLORS["sidebar"],
             fg=COLORS["text_inverse"],
-            font=("Segoe UI", 19, "bold"),
+            font=("Segoe UI", 24, "bold"),
         )
         self.title.pack(anchor="w")
 
@@ -111,7 +115,7 @@ class Sidebar(tk.Frame):
             header,
             text="local · outils · labo",
             bg=COLORS["sidebar"],
-            fg="#9a96a8",
+            fg=TEXT_FAINT,
             font=FONT["small"],
         )
         self.subtitle.pack(
@@ -128,8 +132,8 @@ class Sidebar(tk.Frame):
         )
         self.new_button.pack(
             fill="x",
-            padx=14,
-            pady=(10, 12),
+            padx=20,
+            pady=(16, 16),
         )
 
         Divider(
@@ -137,7 +141,7 @@ class Sidebar(tk.Frame):
             color=COLORS["border_dark"],
         ).pack(
             fill="x",
-            padx=14,
+            padx=20,
         )
 
         # Navigation
@@ -147,18 +151,32 @@ class Sidebar(tk.Frame):
         )
         self.nav.pack(
             fill="x",
-            padx=10,
+            padx=0,
             pady=10,
         )
 
-        self.chat_button = self._nav_button(
-            "💬  Chat",
+        self.chat_button, self.chat_indicator = self._nav_button(
+            "💬  Assistant Chat",
             self._chat,
+            nav_key="chat",
         )
 
-        self.proposals_button = self._nav_button(
-            "🧪  Propositions",
+        self.proposals_button, self.proposals_indicator = self._nav_button(
+            "🧠  Auto-Amélioration",
             self._proposals,
+            nav_key="proposals",
+        )
+
+        self.tools_button, self.tools_indicator = self._nav_button(
+            "🛠️  Catalogue Outils",
+            self._tools,
+            nav_key="tools",
+        )
+
+        self.diag_button, self.diag_indicator = self._nav_button(
+            "📊  Diagnostics",
+            self._diag,
+            nav_key="diag",
         )
 
         # Discussions
@@ -166,7 +184,7 @@ class Sidebar(tk.Frame):
             self,
             text="DISCUSSIONS",
             bg=COLORS["sidebar"],
-            fg="#777286",
+            fg=TEXT_FAINT,
             font=FONT["small_bold"],
         ).pack(
             anchor="w",
@@ -184,7 +202,7 @@ class Sidebar(tk.Frame):
             padx=8,
         )
 
-        # Footer
+        # Footer avec modèle
         footer = tk.Frame(
             self,
             bg=COLORS["sidebar"],
@@ -192,17 +210,40 @@ class Sidebar(tk.Frame):
         footer.pack(
             fill="x",
             padx=10,
-            pady=10,
+            pady=(4, 0),
         )
 
-        self.quit_button = self._nav_button(
-            "Quitter",
+        # Indicateur modèle
+        self._model_frame = tk.Frame(footer, bg=COLORS["sidebar"])
+        self._model_frame.pack(fill="x", padx=8, pady=(4, 4))
+
+        self._model_lbl = tk.Label(
+            self._model_frame,
+            text="● Modèle : chargement…",
+            bg=COLORS["sidebar"],
+            fg=TEXT_FAINT,
+            font=FONT["small"],
+            anchor="w",
+        )
+        self._model_lbl.pack(side="left")
+
+        Divider(
+            footer,
+            color=BORDER_SOFT,
+        ).pack(fill="x", padx=4, pady=(4, 0))
+
+        self.quit_button, _ = self._nav_button(
+            "🚪  Quitter",
             self._quit,
             parent=footer,
+            nav_key=None,
         )
 
+        # Active chat par défaut
+        self._update_nav_visual("chat")
+
     # ------------------------------------------------------------------
-    # NAVIGATION
+    # NAVIGATION — Boutons avec accent indicator
     # ------------------------------------------------------------------
 
     def _nav_button(
@@ -210,11 +251,20 @@ class Sidebar(tk.Frame):
         text,
         command,
         parent=None,
+        nav_key=None,
     ):
         parent = parent or self.nav
 
+        row = tk.Frame(parent, bg=COLORS["sidebar"])
+        row.pack(fill="x", pady=1)
+
+        # Barre d'accent colorée à gauche
+        indicator = tk.Frame(row, bg=COLORS["sidebar"], width=3)
+        indicator.pack(side="left", fill="y")
+        indicator.pack_propagate(False)
+
         button = tk.Button(
-            parent,
+            row,
             text=text,
             command=command,
             anchor="w",
@@ -227,16 +277,33 @@ class Sidebar(tk.Frame):
             activeforeground=COLORS["text_inverse"],
             font=FONT["body"],
             padx=12,
-            pady=8,
+            pady=9,
             cursor="hand2",
         )
 
         button.pack(
+            side="left",
             fill="x",
-            pady=2,
+            expand=True,
         )
 
-        return button
+        # Hover effects
+        def _on_enter(_e, btn=button, row_=row, ind=indicator, key=nav_key):
+            if self._active_nav != key:
+                btn.configure(bg=COLORS["sidebar_alt"], fg=TEXT)
+                row_.configure(bg=COLORS["sidebar_alt"])
+
+        def _on_leave(_e, btn=button, row_=row, ind=indicator, key=nav_key):
+            if self._active_nav != key:
+                btn.configure(bg=COLORS["sidebar"], fg="#d8d5df")
+                row_.configure(bg=COLORS["sidebar"])
+
+        button.bind("<Enter>", _on_enter)
+        button.bind("<Leave>", _on_leave)
+        row.bind("<Enter>", _on_enter)
+        row.bind("<Leave>", _on_leave)
+
+        return button, indicator
 
     def _new(self):
         if self.on_new:
@@ -254,33 +321,54 @@ class Sidebar(tk.Frame):
         elif self.on_nav:
             self.on_nav("proposals")
 
+    def _tools(self):
+        if self.on_nav:
+            self.on_nav("tools")
+
+    def _diag(self):
+        if self.on_nav:
+            self.on_nav("diag")
+
     def _quit(self):
         if self.on_quit:
             self.on_quit()
 
+    # ------------------------------------------------------------------
+    # FIX BUG 3 : set_active_nav met à jour TOUS les boutons
+    # ------------------------------------------------------------------
+
+    def _update_nav_visual(self, view_name: str):
+        """Met à jour visuellement les boutons de navigation."""
+
+        nav_map = {
+            "chat": (self.chat_button, self.chat_indicator),
+            "proposals": (self.proposals_button, self.proposals_indicator),
+            "tools": (self.tools_button, self.tools_indicator),
+            "diag": (self.diag_button, self.diag_indicator),
+        }
+
+        for key, (btn, ind) in nav_map.items():
+            if key == view_name:
+                # Actif : accent cyan
+                btn.configure(
+                    bg=ELEVATED,
+                    fg=ACCENT,
+                    font=("Segoe UI", 12, "bold"),
+                )
+                ind.configure(bg=ACCENT)
+            else:
+                # Inactif
+                btn.configure(
+                    bg=COLORS["sidebar"],
+                    fg="#d8d5df",
+                    font=FONT["body"],
+                )
+                ind.configure(bg=COLORS["sidebar"])
+
     def set_active_nav(self, view_name: str):
-        """Active le bouton de navigation correspondant."""
-
-        self.chat_button.configure(
-            bg=COLORS["sidebar"]
-        )
-
-        self.proposals_button.configure(
-            bg=COLORS["sidebar"]
-        )
-
-        if view_name == "chat":
-            self.chat_button.configure(
-                bg=COLORS["sidebar_alt"]
-            )
-
-        elif view_name in (
-            "proposals",
-            "propositions",
-        ):
-            self.proposals_button.configure(
-                bg=COLORS["sidebar_alt"]
-            )
+        """Active le bouton de navigation correspondant (API publique)."""
+        self._active_nav = view_name
+        self._update_nav_visual(view_name)
 
     # ------------------------------------------------------------------
     # SESSIONS
@@ -293,22 +381,6 @@ class Sidebar(tk.Frame):
     ):
         """
         Remplace complètement la liste des discussions.
-
-        Formats acceptés :
-
-            [
-                ("id1", "Discussion 1"),
-                ("id2", "Discussion 2"),
-            ]
-
-        ou :
-
-            [
-                {
-                    "id": "id1",
-                    "title": "Discussion 1",
-                }
-            ]
         """
 
         self.clear_sessions()
@@ -557,26 +629,32 @@ class Sidebar(tk.Frame):
             self.on_delete_session(session_id)
 
     # ------------------------------------------------------------------
-    # NAV COUNTS (méthode manquante ajoutée)
+    # NAV COUNTS
     # ------------------------------------------------------------------
 
     def set_nav_counts(self, chat=None, proposals=None):
         """
         Met à jour les compteurs de navigation.
-        Cette méthode peut être étendue pour afficher des badges.
+        Peut afficher un badge numérique sur les boutons nav.
         """
-        # Pour l'instant, cette méthode ne fait rien visuellement
-        # mais elle existe pour éviter les AttributeError
         pass
 
     def set_model(self, name, detail, online=True):
         """
-        Affiche les informations du modèle.
-        Cette méthode peut être étendue pour afficher le modèle dans la sidebar.
+        Affiche les informations du modèle dans le footer de la sidebar.
         """
-        # Pour l'instant, cette méthode ne fait rien visuellement
-        # mais elle existe pour éviter les AttributeError
-        pass
+        try:
+            color = "#00e676" if online else "#ff9100"
+            dot = "●"
+            display = f"{dot} {name}"
+            if detail:
+                display += f"  —  {detail}"
+            self._model_lbl.configure(
+                text=display,
+                fg=color,
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # OUVERTURE / FERMETURE

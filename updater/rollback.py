@@ -5,6 +5,7 @@ Sauvegardes et restauration — PATCHÉ v2
 import os
 import shutil
 import json
+import re
 import time
 from pathlib import Path
 from datetime import datetime, timezone
@@ -32,6 +33,24 @@ os.makedirs(DOSSIER_SAUVEGARDES, exist_ok=True)
 EXCLUS_BACKUP = {".git", "__pycache__", ".vscode", "logs", "venv", ".venv", "node_modules"}
 EXCLUS_RESTAURATION = {"workspace", "logs"}
 
+
+def _chemin_sauvegarde(nom_sauvegarde):
+    """Résout un nom de sauvegarde sans autoriser de sortie du dépôt dédié."""
+    nom = str(nom_sauvegarde or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", nom):
+        raise ValueError("Nom de sauvegarde invalide.")
+    racine = Path(DOSSIER_SAUVEGARDES).resolve()
+    chemin = (racine / nom).resolve()
+    try:
+        chemin.relative_to(racine)
+    except ValueError as exc:
+        raise ValueError("Sauvegarde hors répertoire autorisé.") from exc
+    return chemin
+
+
+def _etiquette_sure(etiquette):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(etiquette or "")).strip("._")[:80]
+
 def _ignorer_backup(dossier, contenu):
     return [nom for nom in contenu if nom in EXCLUS_BACKUP]
 
@@ -45,7 +64,7 @@ def _creer_metadonnees(nom_sauvegarde, etiquette="", fichiers_sauvegardes=None):
         meta["version"] = checker.version_locale()
     except Exception:
         pass
-    chemin_meta = Path(DOSSIER_SAUVEGARDES) / nom_sauvegarde / "_backup_meta.json"
+    chemin_meta = _chemin_sauvegarde(nom_sauvegarde) / "_backup_meta.json"
     try:
         chemin_meta.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
@@ -53,7 +72,10 @@ def _creer_metadonnees(nom_sauvegarde, etiquette="", fichiers_sauvegardes=None):
     return meta
 
 def _charger_metadonnees(nom_sauvegarde):
-    chemin_meta = Path(DOSSIER_SAUVEGARDES) / nom_sauvegarde / "_backup_meta.json"
+    try:
+        chemin_meta = _chemin_sauvegarde(nom_sauvegarde) / "_backup_meta.json"
+    except ValueError:
+        return None
     if not chemin_meta.exists():
         return None
     try:
@@ -66,7 +88,7 @@ def marquer_backup_important(nom_sauvegarde):
     if not meta:
         return False
     meta["important"] = True
-    chemin_meta = Path(DOSSIER_SAUVEGARDES) / nom_sauvegarde / "_backup_meta.json"
+    chemin_meta = _chemin_sauvegarde(nom_sauvegarde) / "_backup_meta.json"
     try:
         chemin_meta.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         log_event("updater", f"Backup marqué important : {nom_sauvegarde}")
@@ -78,8 +100,9 @@ def marquer_backup_important(nom_sauvegarde):
 def creer_sauvegarde(etiquette=""):
     t0 = time.perf_counter()
     horodatage = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    etiquette = _etiquette_sure(etiquette)
     nom_dossier = f"{horodatage}_{etiquette}".rstrip("_")
-    chemin_sauvegarde = os.path.join(DOSSIER_SAUVEGARDES, nom_dossier)
+    chemin_sauvegarde = str(_chemin_sauvegarde(nom_dossier))
     shutil.copytree(DEPOT_DIR, chemin_sauvegarde, ignore=_ignorer_backup)
     fichiers = [f for f in Path(chemin_sauvegarde).rglob("*") if f.is_file()]
     _creer_metadonnees(nom_dossier, etiquette, fichiers)
@@ -113,7 +136,10 @@ def lister_sauvegardes_detaillees():
     return "\n".join(lignes)
 
 def analyser_backup(nom_sauvegarde):
-    chemin = Path(DOSSIER_SAUVEGARDES) / nom_sauvegarde
+    try:
+        chemin = _chemin_sauvegarde(nom_sauvegarde)
+    except ValueError as exc:
+        return {"existe": False, "message": str(exc)}
     if not chemin.exists():
         return {"existe": False, "message": f"Sauvegarde '{nom_sauvegarde}' introuvable."}
     meta = _charger_metadonnees(nom_sauvegarde)
@@ -124,7 +150,7 @@ def analyser_backup(nom_sauvegarde):
 def restaurer_sauvegarde_specifique(nom_sauvegarde, confirmer=False, supprimer_nouveaux=False):
     if not confirmer:
         raise PermissionError("Restauration refusée sans confirmation explicite (confirmer=True).")
-    chemin_source = Path(DOSSIER_SAUVEGARDES) / nom_sauvegarde
+    chemin_source = _chemin_sauvegarde(nom_sauvegarde)
     if not chemin_source.exists():
         raise FileNotFoundError(f"Sauvegarde '{nom_sauvegarde}' introuvable.")
     log_event("updater", f"Restauration depuis : {nom_sauvegarde}")

@@ -165,13 +165,54 @@ register_tool("creer_document_pdf", creer_document_pdf,
     {"type":"object","properties":{"nom_fichier":{"type":"string"},"titre":{"type":"string"},"contenu":{"type":"string"}},"required":["nom_fichier","titre","contenu"]})
 
 
+# --- Auto-Amélioration & Recherche ---
+
+try:
+    from tools.self_improvement_tools import (
+        analyser_sante_jibi,
+        tableau_bord_amelioration,
+        preparer_amelioration,
+    )
+    register_tool("analyser_sante_jibi", analyser_sante_jibi,
+        "Analyse la santé globale et les logs récents de JIBI pour détecter anomalies.",
+        {"type":"object","properties":{"limite_logs":{"type":"integer"}},"required":[]})
+    register_tool("tableau_bord_amelioration", tableau_bord_amelioration,
+        "Tableau de bord de l'auto-amélioration et propositions d'évolution.",
+        {"type":"object","properties":{},"required":[]})
+    register_tool("preparer_amelioration", preparer_amelioration,
+        "Prépare une proposition d'amélioration de code dans le laboratoire.",
+        {"type":"object","properties":{"fichier":{"type":"string"},"probleme":{"type":"string"},"solution":{"type":"string"}},"required":["fichier","probleme","solution"]})
+except Exception as _e_si:
+    pass
+
+try:
+    from tools.web_search import rechercher_web
+    register_tool("rechercher_web", rechercher_web,
+        "Effectue une recherche d'informations en ligne via le Web.",
+        {"type":"object","properties":{"requete":{"type":"string"}},"required":["requete"]})
+except Exception as _e_ws:
+    pass
+
+
+def obtenir_catalogue_outils():
+    """Renvoie la liste structurée des outils pour affichage GUI."""
+    catalogue = []
+    for name, data in TOOLS_REGISTRY.items():
+        catalogue.append({
+            "nom": name,
+            "description": data.get("description", ""),
+            "actif": True,
+        })
+    return catalogue
+
+
 # ===========================================================================
 # VÉRIFICATION
 # ===========================================================================
 
 def verifier_registre():
     outils_attendus = [
-        "ouvrir_application","application_est_lancee","obtenir_etat_application","obtener_processus",
+        "ouvrir_application","application_est_lancee","obtenir_etat_application","obtenir_processus",
         "fermer_application","informations_systeme","ouvrir_fichier","ouvrir_dossier","creer_dossier",
         "rechercher_fichiers","renommer_fichier","deplacer_fichier","copier_fichier","supprimer_fichier",
         "obtenir_espace_disque","obtenir_infos_systeme_detaillees","lister_applications_ouvertes",
@@ -181,3 +222,4 @@ def verifier_registre():
     return (False, manquants) if manquants else (True, [])
 
 REGISTRE_OK, OUTILS_MANQUANTS = verifier_registre()
+
